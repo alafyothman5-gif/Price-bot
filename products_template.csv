@@ -1,0 +1,7 @@
+name,aliases,active_ingredient,company,form,strength,pack,price,available,notes,image
+بنادول أدفانس,بنادول|بندول|panadol,Paracetamol,GSK,أقراص,500mg,شريط,5 د.ل,متوفر,,
+بنادول إكسترا,بنادول اكسترا|بندول احمر|panadol extra,Paracetamol+Caffeine,GSK,أقراص,500mg/65mg,شريط,8 د.ل,متوفر,,https://example.com/panadol-extra.jpg
+فلاجيل أقراص 250,فلاجيل|flagyl|metronidazole,Metronidazole,Sanofi,أقراص,250mg,شريط,10 د.ل,متوفر,,
+فلاجيل أقراص 500,فلاجيل|flagyl|metronidazole,Metronidazole,Sanofi,أقراص,500mg,شريط,12 د.ل,متوفر,,
+أوجمنتين 625,اوجمنتين|augmentin,Amoxicillin+Clavulanate,إنجليزي,أقراص,625mg,علبة,35 د.ل,متوفر,,
+أموكلان 625,اموكلان|amoclan|amoxicillin clavulanate,Amoxicillin+Clavulanate,أردني,أقراص,625mg,علبة,18 د.ل,متوفر,,
