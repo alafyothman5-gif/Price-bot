@@ -1,0 +1,6009 @@
+from __future__ import annotations
+
+import base64
+import csv
+import html
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import sqlite3
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from fastapi import FastAPI, File, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from openpyxl import load_workbook
+import uvicorn
+
+# =============================================================================
+# PriceBot WhatsApp Webhook + Admin Panel
+# -----------------------------------------------------------------------------
+# Data files are intentionally CSV files so the owner can back them up and edit
+# them easily. Secrets are never stored in this file; they must be in .env.
+# =============================================================================
+
+APP_DIR = Path(os.getenv("PRICEBOT_DATA_DIR", Path(__file__).resolve().parent))
+ENV_FILE = Path(os.getenv("PRICEBOT_ENV_FILE", APP_DIR / ".env"))
+PRODUCTS_FILE = Path(os.getenv("PRODUCTS_FILE", APP_DIR / "products.csv"))
+ORDERS_FILE = Path(os.getenv("ORDERS_FILE", APP_DIR / "orders.csv"))
+MEDIA_DIR = Path(os.getenv("PRICEBOT_MEDIA_DIR", APP_DIR / "media"))
+MEMORY_FILE = Path(os.getenv("PRICEBOT_MEMORY_FILE", APP_DIR / "memory.json"))
+DB_FILE = Path(os.getenv("PRICEBOT_DB_FILE", APP_DIR / "pricebot.db"))
+
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "pricebot_verify_2026")
+ADMIN_KEY = os.getenv("PRICEBOT_ADMIN_KEY", os.getenv("ADMIN_KEY", "PriceBotAdmin2026"))
+ADMIN_NOTIFY_PHONE = os.getenv("ADMIN_NOTIFY_PHONE", "")
+GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v20.0")
+
+PRODUCT_FIELDS = [
+    "name", "aliases", "active_ingredient", "brand", "company", "form", "strength", "pack",
+    "price", "available", "notes", "image"
+]
+ORDER_FIELDS = ["time", "phone", "product", "price", "available", "notes", "message", "status"]
+
+TOKEN_ENV_NAMES = [
+    "WHATSAPP_ACCESS_TOKEN",
+    "WHATSAPP_TOKEN",
+    "WA_ACCESS_TOKEN",
+    "WA_TOKEN",
+    "WHATSAPP_API_TOKEN",
+    "WHATSAPP_BEARER_TOKEN",
+    "WHATSAPP_PERMANENT_TOKEN",
+    "META_WHATSAPP_ACCESS_TOKEN",
+    "META_WHATSAPP_TOKEN",
+    "META_ACCESS_TOKEN",
+    "META_TOKEN",
+    "FACEBOOK_ACCESS_TOKEN",
+    "FB_ACCESS_TOKEN",
+    "GRAPH_API_TOKEN",
+    "CLOUD_API_TOKEN",
+    "PRICEBOT_TOKEN",
+    "ACCESS_TOKEN",
+]
+
+PHONE_ID_ENV_NAMES = [
+    "WHATSAPP_PHONE_NUMBER_ID",
+    "WA_PHONE_NUMBER_ID",
+    "PHONE_NUMBER_ID",
+    "META_PHONE_NUMBER_ID",
+    "META_WHATSAPP_PHONE_NUMBER_ID",
+]
+
+app = FastAPI(title="PriceBot", version="3.0.0")
+LAST_PRODUCT: Dict[str, dict] = {}
+PENDING_SUGGESTION: Dict[str, dict] = {}
+PENDING_OPTIONS: Dict[str, dict] = {}
+PENDING_ALT_REQUESTS: Dict[str, dict] = {}
+
+
+def load_dotenv_file() -> None:
+    """Load .env values into os.environ without overwriting already set vars."""
+    if not ENV_FILE.exists():
+        return
+    try:
+        for raw_line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception as exc:
+        print(f"ENV LOAD WARNING: {exc}", flush=True)
+
+
+def read_env_file_value(names: Iterable[str]) -> str:
+    """Read one of the requested names directly from .env, preferring top names."""
+    names = list(names)
+    values: Dict[str, str] = {}
+    if ENV_FILE.exists():
+        try:
+            for raw_line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip().strip('"').strip("'")
+        except Exception as exc:
+            print(f"ENV READ WARNING: {exc}", flush=True)
+    for name in names:
+        if values.get(name):
+            return values[name]
+    for name in names:
+        if os.getenv(name):
+            return os.getenv(name, "")
+    return ""
+
+
+def clean_token(token: str) -> str:
+    token = (token or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token.strip().strip('"').strip("'")
+
+
+def get_access_token() -> str:
+    return clean_token(read_env_file_value(TOKEN_ENV_NAMES))
+
+
+def get_phone_number_id() -> str:
+    return read_env_file_value(PHONE_ID_ENV_NAMES).strip()
+
+
+def get_config(name: str, default: str = "") -> str:
+    """Read optional business settings from environment or .env without exposing secrets."""
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    if ENV_FILE.exists():
+        try:
+            for raw_line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, raw_value = line.split("=", 1)
+                if key.strip() == name:
+                    return raw_value.strip().strip('"').strip("'")
+        except Exception as exc:
+            print(f"CONFIG READ WARNING: {exc}", flush=True)
+    return default
+
+
+def business_name() -> str:
+    return get_config("PHARMACY_NAME", "صيدلية بدر البشرية")
+
+
+def business_city() -> str:
+    return get_config("PHARMACY_CITY", "أجدابيا")
+
+
+def business_hours() -> str:
+    return get_config("PHARMACY_HOURS", "24 ساعة")
+
+
+def delivery_enabled() -> bool:
+    value = get_config("DELIVERY_AVAILABLE", "no").strip().lower()
+    return value in {"1", "true", "yes", "y", "نعم", "متوفر"}
+
+
+def delivery_text() -> str:
+    if delivery_enabled():
+        return get_config("DELIVERY_TEXT", "التوصيل متوفر")
+    return get_config("DELIVERY_TEXT", "التوصيل غير متوفر حالياً")
+
+
+def admin_notify_phone() -> str:
+    """Optional WhatsApp number that receives internal admin alerts."""
+    return normalize_phone(get_config("ADMIN_NOTIFY_PHONE", ""))
+
+
+def public_base_url() -> str:
+    return get_config("PUBLIC_BASE_URL", "https://46.101.148.246.sslip.io").rstrip("/")
+
+
+def normalize_phone(phone: str) -> str:
+    """Keep digits only, convert 00 prefix, and remove + for WhatsApp Cloud API."""
+    phone = str(phone or "").strip()
+    phone = phone.replace("+", "").replace(" ", "").replace("-", "")
+    phone = re.sub(r"\D+", "", phone)
+    if phone.startswith("00"):
+        phone = phone[2:]
+    return phone
+
+
+# =============================================================================
+# Optional real AI integration with multi-provider fallback
+# =============================================================================
+def config_bool(name: str, default: bool = False) -> bool:
+    raw = get_config(name, "1" if default else "0").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on", "نعم", "مفعل"}
+
+
+def split_secret_list(raw: str) -> List[str]:
+    """Parse keys from .env values or admin textareas without exposing them."""
+    raw = (raw or "").replace("\r", "\n")
+    parts: List[str] = []
+    for chunk in re.split(r"[\n,;|]+", raw):
+        value = clean_token(chunk)
+        if value and value not in parts:
+            parts.append(value)
+    return parts
+
+
+def join_secret_list(raw: str) -> str:
+    return "||".join(split_secret_list(raw))
+
+
+def ai_provider_order() -> List[str]:
+    raw = get_config("AI_PROVIDER_ORDER", "gemini,openrouter,groq")
+    supported = {"openrouter", "gemini", "groq", "openai", "custom"}
+    out: List[str] = []
+    for item in re.split(r"[,;|\n]+", raw):
+        name = item.strip().lower()
+        if name in supported and name not in out:
+            out.append(name)
+    return out or ["gemini", "openrouter", "groq"]
+
+
+def provider_key_env(provider: str) -> str:
+    return {
+        "openrouter": "AI_OPENROUTER_KEYS",
+        "gemini": "AI_GEMINI_KEYS",
+        "groq": "AI_GROQ_KEYS",
+        "openai": "AI_OPENAI_KEYS",
+        "custom": "AI_CUSTOM_KEYS",
+    }.get(provider, "AI_API_KEY")
+
+
+def ai_keys_for_provider(provider: str) -> List[str]:
+    keys = split_secret_list(get_config(provider_key_env(provider), ""))
+    # Backward compatibility with the old single-key setting.
+    legacy_provider = get_config("AI_PROVIDER", "openrouter").strip().lower() or "openrouter"
+    legacy_key = clean_token(get_config("AI_API_KEY", ""))
+    if legacy_key and provider == legacy_provider and legacy_key not in keys:
+        keys.append(legacy_key)
+    return keys
+
+
+def any_ai_key_saved() -> bool:
+    return any(ai_keys_for_provider(provider) for provider in ai_provider_order())
+
+
+def ai_enabled() -> bool:
+    return config_bool("AI_ENABLED", False) and any_ai_key_saved()
+
+
+def ai_provider() -> str:
+    # Compatibility for old UI/health; the actual call uses ai_provider_order().
+    order = ai_provider_order()
+    return order[0] if order else "openrouter"
+
+
+def ai_default_model_for(provider: str) -> str:
+    if provider == "gemini":
+        return "gemini-2.5-flash-lite"
+    if provider == "groq":
+        return "llama-3.1-8b-instant"
+    if provider == "openai":
+        return "gpt-4o-mini"
+    return "openrouter/free"
+
+
+def ai_model_for(provider: str) -> str:
+    specific = {
+        "openrouter": "AI_OPENROUTER_MODEL",
+        "gemini": "AI_GEMINI_MODEL",
+        "groq": "AI_GROQ_MODEL",
+        "openai": "AI_OPENAI_MODEL",
+        "custom": "AI_CUSTOM_MODEL",
+    }.get(provider, "AI_MODEL")
+    return get_config(specific, "").strip() or get_config("AI_MODEL", "").strip() or ai_default_model_for(provider)
+
+
+def ai_model() -> str:
+    return ai_model_for(ai_provider())
+
+
+def ai_api_key() -> str:
+    # Compatibility helper: first key in the first available provider.
+    for provider in ai_provider_order():
+        keys = ai_keys_for_provider(provider)
+        if keys:
+            return keys[0]
+    return ""
+
+
+def masked_count_for(provider: str) -> str:
+    count = len(ai_keys_for_provider(provider))
+    return f"{count} مفتاح" if count else "لا يوجد"
+
+
+def ai_status_text() -> str:
+    counts = [f"{provider}: {masked_count_for(provider)}" for provider in ai_provider_order()]
+    if ai_enabled():
+        return "مفعل — " + " | ".join(counts)
+    return "غير مفعل — " + " | ".join(counts)
+
+
+def ai_default_model() -> str:
+    return ai_default_model_for(ai_provider())
+
+
+def ai_endpoint_for(provider: str) -> str:
+    if provider == "gemini":
+        return ""
+    if provider == "openai":
+        return get_config("AI_OPENAI_BASE_URL", get_config("AI_BASE_URL", "https://api.openai.com/v1/chat/completions"))
+    if provider == "groq":
+        return get_config("AI_GROQ_BASE_URL", "https://api.groq.com/openai/v1/chat/completions")
+    if provider == "custom":
+        return get_config("AI_CUSTOM_BASE_URL", get_config("AI_BASE_URL", "")).strip()
+    return get_config("AI_OPENROUTER_BASE_URL", get_config("AI_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"))
+
+
+def ai_provider_display_name(provider: str) -> str:
+    return {
+        "openrouter": "OpenRouter",
+        "gemini": "Gemini",
+        "groq": "Groq",
+        "openai": "OpenAI",
+        "custom": "Custom",
+    }.get(provider, provider)
+
+
+load_dotenv_file()
+
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def normalize(text: str) -> str:
+    text = (text or "").strip().lower()
+    replacements = {
+        "أ": "ا",
+        "إ": "ا",
+        "آ": "ا",
+        "ٱ": "ا",
+        "ى": "ي",
+        "ة": "ه",
+        "ؤ": "و",
+        "ئ": "ي",
+        "ـ": "",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    text = re.sub(r"[\u064b-\u065f\u0670]", "", text)  # Arabic tashkeel
+    text = re.sub(r"[^\w\s\u0600-\u06FF]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+
+
+# =============================================================================
+# SQLite database layer
+# -----------------------------------------------------------------------------
+# The bot now stores products, orders, memory/cache, corrections, and AI counters
+# in a single local SQLite database: pricebot.db. Existing CSV/JSON files are
+# imported automatically on first use and then kept as backup/export mirrors.
+# =============================================================================
+def db_connect() -> sqlite3.Connection:
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_FILE), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def ensure_sqlite_db() -> None:
+    with db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                aliases TEXT DEFAULT '',
+                active_ingredient TEXT DEFAULT '',
+                brand TEXT DEFAULT '',
+                company TEXT DEFAULT '',
+                form TEXT DEFAULT '',
+                strength TEXT DEFAULT '',
+                pack TEXT DEFAULT '',
+                price TEXT DEFAULT '',
+                available TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                image TEXT DEFAULT '',
+                created_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT ''
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_products_name ON products(name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_products_active ON products(active_ingredient)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_products_strength ON products(strength)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time TEXT DEFAULT '',
+                phone TEXT DEFAULT '',
+                product TEXT DEFAULT '',
+                price TEXT DEFAULT '',
+                available TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                message TEXT DEFAULT '',
+                status TEXT DEFAULT 'new'
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders(phone)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_entries (
+                category TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                created_at TEXT DEFAULT '',
+                updated_at TEXT DEFAULT '',
+                hits INTEGER DEFAULT 0,
+                PRIMARY KEY(category, key)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_category ON memory_entries(category)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_inquiries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time TEXT DEFAULT '',
+                phone TEXT DEFAULT '',
+                query TEXT DEFAULT '',
+                normalized_query TEXT DEFAULT '',
+                product_name TEXT DEFAULT '',
+                found INTEGER DEFAULT 0,
+                source TEXT DEFAULT '',
+                note TEXT DEFAULT ''
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inquiries_time ON product_inquiries(time)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inquiries_product ON product_inquiries(product_name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inquiries_found ON product_inquiries(found)")
+        conn.commit()
+
+
+def db_count(table: str) -> int:
+    ensure_sqlite_db()
+    with db_connect() as conn:
+        return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+
+def _csv_row_get(row: dict, *names: str, default: str = '') -> str:
+    for name in names:
+        val = row.get(name)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    normalized = {normalize(str(k)): v for k, v in row.items()}
+    for name in names:
+        val = normalized.get(normalize(name))
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return default
+
+
+def _product_from_csv_row(row: dict) -> dict:
+    return {
+        "name": _csv_row_get(row, "name", "product", "product_name", "اسم", "الاسم", "اسم المنتج"),
+        "aliases": _csv_row_get(row, "aliases", "alias", "أسماء بديلة", "اسماء بديلة", "بدائل"),
+        "active_ingredient": _csv_row_get(row, "active_ingredient", "ingredient", "generic", "المادة الفعالة", "ماده فعاله", "المادة", "ماده"),
+        "brand": _csv_row_get(row, "brand", "trade_name", "ماركة", "الماركة", "براند", "اسم تجاري"),
+        "company": _csv_row_get(row, "company", "manufacturer", "origin", "country", "الشركة", "الشركه", "المنشأ", "بلد", "البلد"),
+        "form": _csv_row_get(row, "form", "dosage_form", "shape", "الشكل", "الشكل الدوائي", "نوع", "النوع"),
+        "strength": _csv_row_get(row, "strength", "concentration", "dose", "التركيز", "جرعة", "عيار"),
+        "pack": _csv_row_get(row, "pack", "package", "pack_size", "العبوة", "عبوة", "التعبئة"),
+        "price": _csv_row_get(row, "price", "سعر", "السعر"),
+        "available": _csv_row_get(row, "available", "availability", "stock", "توفر", "التوفر", "الحالة", default="متوفر") or "متوفر",
+        "notes": _csv_row_get(row, "notes", "note", "ملاحظات", "ملاحظة"),
+        "image": _csv_row_get(row, "image", "image_url", "photo", "صورة", "رابط الصورة"),
+    }
+
+
+def read_products_from_csv_file() -> List[dict]:
+    if not PRODUCTS_FILE.exists():
+        return []
+    products: List[dict] = []
+    try:
+        with PRODUCTS_FILE.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                item = _product_from_csv_row(row)
+                if item.get("name"):
+                    products.append(item)
+    except Exception as exc:
+        print(f"PRODUCT CSV IMPORT WARNING: {exc}", flush=True)
+    return products
+
+
+def read_orders_from_csv_file() -> List[dict]:
+    if not ORDERS_FILE.exists():
+        return []
+    try:
+        with ORDERS_FILE.open("r", encoding="utf-8-sig", newline="") as f:
+            return [{field: row.get(field, '') for field in ORDER_FIELDS} for row in csv.DictReader(f)]
+    except Exception as exc:
+        print(f"ORDER CSV IMPORT WARNING: {exc}", flush=True)
+        return []
+
+
+def insert_product_rows(conn: sqlite3.Connection, products: List[dict]) -> None:
+    now = now_str()
+    rows = []
+    for item in products:
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+        rows.append(tuple(str(item.get(field, "")).strip() for field in PRODUCT_FIELDS) + (now, now))
+    if rows:
+        conn.executemany(
+            f"INSERT INTO products ({','.join(PRODUCT_FIELDS)},created_at,updated_at) VALUES ({','.join(['?'] * (len(PRODUCT_FIELDS)+2))})",
+            rows,
+        )
+
+
+def insert_order_rows(conn: sqlite3.Connection, orders: List[dict]) -> None:
+    rows = []
+    for row in orders:
+        rows.append(tuple(str(row.get(field, "")).strip() for field in ORDER_FIELDS))
+    if rows:
+        conn.executemany(
+            f"INSERT INTO orders ({','.join(ORDER_FIELDS)}) VALUES ({','.join(['?'] * len(ORDER_FIELDS))})",
+            rows,
+        )
+
+
+def migrate_legacy_files_to_db() -> None:
+    ensure_sqlite_db()
+    with db_connect() as conn:
+        if int(conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]) == 0:
+            products = read_products_from_csv_file()
+            if products:
+                insert_product_rows(conn, products)
+                print(f"DB MIGRATE: imported {len(products)} products from CSV", flush=True)
+        if int(conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]) == 0:
+            orders = read_orders_from_csv_file()
+            if orders:
+                insert_order_rows(conn, orders)
+                print(f"DB MIGRATE: imported {len(orders)} orders from CSV", flush=True)
+        if int(conn.execute("SELECT COUNT(*) FROM memory_entries").fetchone()[0]) == 0 and MEMORY_FILE.exists():
+            try:
+                data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    _write_memory_to_db(conn, data, clear_existing=False)
+                    print("DB MIGRATE: imported memory.json", flush=True)
+            except Exception as exc:
+                print(f"MEMORY JSON IMPORT WARNING: {exc}", flush=True)
+        conn.commit()
+
+
+def mirror_products_to_csv(products: List[dict]) -> None:
+    PRODUCTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix="products_", suffix=".csv", dir=str(PRODUCTS_FILE.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with tmp_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=PRODUCT_FIELDS)
+            writer.writeheader()
+            for item in products:
+                if str(item.get("name", "")).strip():
+                    writer.writerow({field: str(item.get(field, "")).strip() for field in PRODUCT_FIELDS})
+        tmp_path.replace(PRODUCTS_FILE)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def mirror_orders_to_csv(orders: List[dict]) -> None:
+    ORDERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix="orders_", suffix=".csv", dir=str(ORDERS_FILE.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with tmp_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=ORDER_FIELDS)
+            writer.writeheader()
+            for row in orders:
+                writer.writerow({field: row.get(field, "") for field in ORDER_FIELDS})
+        tmp_path.replace(ORDERS_FILE)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def _write_memory_to_db(conn: sqlite3.Connection, data: dict, clear_existing: bool = True) -> None:
+    if clear_existing:
+        conn.execute("DELETE FROM memory_entries")
+    now = now_str()
+    rows = []
+    for category in ["query_cache", "product_alias_memory", "image_cache", "admin_corrections", "ai_usage"]:
+        section = data.get(category, {}) if isinstance(data, dict) else {}
+        if not isinstance(section, dict):
+            continue
+        for key, value in section.items():
+            rows.append((category, str(key), json.dumps(value, ensure_ascii=False), now, now, 0))
+    if rows:
+        conn.executemany(
+            "INSERT OR REPLACE INTO memory_entries(category,key,value_json,created_at,updated_at,hits) VALUES (?,?,?,?,?,?)",
+            rows,
+        )
+
+
+def db_stats() -> dict:
+    ensure_sqlite_db()
+    migrate_legacy_files_to_db()
+    with db_connect() as conn:
+        return {
+            "db_file": str(DB_FILE),
+            "db_size": DB_FILE.stat().st_size if DB_FILE.exists() else 0,
+            "products": int(conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]),
+            "orders": int(conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]),
+            "memory_entries": int(conn.execute("SELECT COUNT(*) FROM memory_entries").fetchone()[0]),
+            "inquiries": int(conn.execute("SELECT COUNT(*) FROM product_inquiries").fetchone()[0]),
+        }
+
+# =============================================================================
+# Persistent memory/cache to reduce AI API usage
+# =============================================================================
+
+def empty_memory() -> dict:
+    return {
+        "version": 3,
+        "storage": "sqlite",
+        "query_cache": {},
+        "product_alias_memory": {},
+        "image_cache": {},
+        "admin_corrections": {},
+        "ai_usage": {},
+    }
+
+
+def memory_get_entry(category: str, key: str) -> object:
+    ensure_sqlite_db()
+    if not key:
+        return None
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT value_json, hits FROM memory_entries WHERE category=? AND key=?",
+            (category, key),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            value = json.loads(row["value_json"])
+        except Exception:
+            value = row["value_json"]
+        conn.execute(
+            "UPDATE memory_entries SET hits=COALESCE(hits,0)+1, updated_at=? WHERE category=? AND key=?",
+            (now_str(), category, key),
+        )
+        conn.commit()
+        if isinstance(value, dict):
+            value["hits"] = int(row["hits"] or 0) + 1
+            value["last_hit"] = now_str()
+        return value
+
+
+def memory_put_entry(category: str, key: str, value: object) -> None:
+    ensure_sqlite_db()
+    if not key:
+        return
+    now = now_str()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO memory_entries(category,key,value_json,created_at,updated_at,hits)
+            VALUES (?,?,?,?,?,0)
+            ON CONFLICT(category,key) DO UPDATE SET
+              value_json=excluded.value_json,
+              updated_at=excluded.updated_at
+            """,
+            (category, key, json.dumps(value, ensure_ascii=False), now, now),
+        )
+        conn.commit()
+
+
+def memory_delete_category(category: str) -> None:
+    ensure_sqlite_db()
+    with db_connect() as conn:
+        conn.execute("DELETE FROM memory_entries WHERE category=?", (category,))
+        conn.commit()
+
+
+def load_memory() -> dict:
+    ensure_sqlite_db()
+    migrate_legacy_files_to_db()
+    data = empty_memory()
+    try:
+        with db_connect() as conn:
+            for row in conn.execute("SELECT category,key,value_json,hits FROM memory_entries ORDER BY updated_at DESC LIMIT 2000"):
+                category = row["category"]
+                if category not in data or not isinstance(data[category], dict):
+                    continue
+                try:
+                    value = json.loads(row["value_json"])
+                except Exception:
+                    value = row["value_json"]
+                if isinstance(value, dict):
+                    value.setdefault("hits", int(row["hits"] or 0))
+                data[category][row["key"]] = value
+    except Exception as exc:
+        print(f"MEMORY DB LOAD WARNING: {exc}", flush=True)
+    return data
+
+
+def save_memory(data: dict) -> None:
+    """Admin-level save only. Runtime message cache uses direct SQLite upserts."""
+    ensure_sqlite_db()
+    with db_connect() as conn:
+        _write_memory_to_db(conn, data, clear_existing=True)
+        conn.commit()
+    # Keep JSON mirror only when admin explicitly changes memory, not on every message.
+    try:
+        MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MEMORY_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"MEMORY JSON MIRROR WARNING: {exc}", flush=True)
+
+
+def memory_query_key(text: str) -> str:
+    q = extract_product_query(text or "") if "extract_product_query" in globals() else (text or "")
+    q = normalize(q or text or "")
+    return q[:180]
+
+
+def find_product_by_name_or_alias(name: str) -> Optional[dict]:
+    n = normalize(name or "")
+    if not n:
+        return None
+    for item in load_products():
+        keys = [item.get("name", "")] + split_aliases(item.get("aliases", ""))
+        for key in keys:
+            if normalize(key) == n:
+                return item
+    item = find_product(name)
+    return item
+
+
+def memory_get_admin_correction(text: str) -> Optional[dict]:
+    key = memory_query_key(text)
+    product_name = memory_get_entry("admin_corrections", key) or memory_get_entry("product_alias_memory", key)
+    if isinstance(product_name, dict):
+        product_name = product_name.get("product_name") or product_name.get("value")
+    if product_name:
+        item = find_product_by_name_or_alias(str(product_name))
+        if item:
+            return item
+    return None
+
+
+def memory_get_query_response(text: str) -> dict:
+    entry = memory_get_entry("query_cache", memory_query_key(text))
+    return entry if isinstance(entry, dict) else {}
+
+
+def memory_remember_product_query(text: str, item: dict, source: str = "local") -> None:
+    key = memory_query_key(text)
+    product_name = str(item.get("name", "")).strip()
+    if not key or not product_name:
+        return
+    memory_put_entry("query_cache", key, {
+        "type": "product",
+        "product_name": product_name,
+        "source": source,
+        "created_at": now_str(),
+    })
+    memory_put_entry("product_alias_memory", key, product_name)
+
+
+def memory_remember_options_query(text: str, items: List[dict], source: str = "local") -> None:
+    key = memory_query_key(text)
+    names = [str(item.get("name", "")).strip() for item in items if str(item.get("name", "")).strip()]
+    if not key or not names:
+        return
+    memory_put_entry("query_cache", key, {
+        "type": "options",
+        "product_names": names[:8],
+        "source": source,
+        "created_at": now_str(),
+    })
+
+
+def memory_items_from_names(names: List[str]) -> List[dict]:
+    out = []
+    seen = set()
+    for name in names:
+        item = find_product_by_name_or_alias(name)
+        if not item:
+            continue
+        k = normalize(item.get("name", ""))
+        if k and k not in seen:
+            out.append(item)
+            seen.add(k)
+    return out
+
+
+def memory_lookup_image(sha: str) -> dict:
+    entry = memory_get_entry("image_cache", sha)
+    return entry if isinstance(entry, dict) else {}
+
+
+def memory_remember_image_product(sha: str, item: dict, source: str = "gemini_vision") -> None:
+    if not sha or not item:
+        return
+    memory_put_entry("image_cache", sha, {
+        "type": "product",
+        "product_name": item.get("name", ""),
+        "source": source,
+        "created_at": now_str(),
+    })
+
+
+def memory_remember_image_review(sha: str, reason: str = "review") -> None:
+    if not sha:
+        return
+    memory_put_entry("image_cache", sha, {
+        "type": "review",
+        "reason": reason,
+        "source": "image_review",
+        "created_at": now_str(),
+    })
+
+
+def memory_record_ai_usage(kind: str, provider: str = "unknown") -> None:
+    day = datetime.now().strftime("%Y-%m-%d")
+    key = f"{day}:{kind}:{provider or 'unknown'}"
+    entry = memory_get_entry("ai_usage", key)
+    count = 0
+    if isinstance(entry, dict):
+        count = int(entry.get("count", 0) or 0)
+    memory_put_entry("ai_usage", key, {
+        "day": day,
+        "kind": kind,
+        "provider": provider or "unknown",
+        "count": count + 1,
+        "updated_at": now_str(),
+    })
+
+
+def memory_stats() -> dict:
+    ensure_sqlite_db()
+    today = datetime.now().strftime("%Y-%m-%d")
+    with db_connect() as conn:
+        def c(cat):
+            return int(conn.execute("SELECT COUNT(*) FROM memory_entries WHERE category=?", (cat,)).fetchone()[0])
+        usage_rows = conn.execute("SELECT key,value_json FROM memory_entries WHERE category='ai_usage' AND key LIKE ?", (today + ":%",)).fetchall()
+    usage = {}
+    for row in usage_rows:
+        try:
+            value = json.loads(row["value_json"])
+            label = f"{value.get('kind','text')}:{value.get('provider','unknown')}"
+            usage[label] = int(value.get("count", 0) or 0)
+        except Exception:
+            pass
+    return {
+        "query_cache": c("query_cache"),
+        "product_alias_memory": c("product_alias_memory"),
+        "image_cache": c("image_cache"),
+        "admin_corrections": c("admin_corrections"),
+        "ai_usage_today": usage,
+    }
+
+
+def split_aliases(aliases: str) -> List[str]:
+    if not aliases:
+        return []
+    parts = re.split(r"[|,،;؛\n]+", aliases)
+    return [part.strip() for part in parts if part and part.strip()]
+
+
+def ensure_csv_file(path: Path, fieldnames: List[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+
+def ensure_products_file() -> None:
+    ensure_csv_file(PRODUCTS_FILE, PRODUCT_FIELDS)
+
+
+def ensure_orders_file() -> None:
+    ensure_csv_file(ORDERS_FILE, ORDER_FIELDS)
+
+
+def _row_get(row: dict, *names: str, default: str = "") -> str:
+    return _csv_row_get(row, *names, default=default)
+
+
+def product_dict_from_db_row(row: sqlite3.Row) -> dict:
+    item = {field: str(row[field] or "") for field in PRODUCT_FIELDS}
+    keyword_parts = [
+        item["name"], item["aliases"], item["active_ingredient"], item["brand"],
+        item["company"], item["form"], item["strength"], item["pack"], item["notes"],
+    ]
+    keywords: List[str] = []
+    for part in keyword_parts:
+        if not part:
+            continue
+        if part == item["aliases"]:
+            keywords.extend(split_aliases(part))
+        else:
+            keywords.append(part)
+    item["keywords"] = [x for x in keywords if str(x).strip()]
+    return item
+
+
+def load_products() -> List[dict]:
+    ensure_sqlite_db()
+    migrate_legacy_files_to_db()
+    with db_connect() as conn:
+        rows = conn.execute(f"SELECT {','.join(PRODUCT_FIELDS)} FROM products ORDER BY id ASC").fetchall()
+    return [product_dict_from_db_row(row) for row in rows]
+
+
+def _pricebot_original_save_products(products: List[dict]) -> None:
+    ensure_sqlite_db()
+    with db_connect() as conn:
+        conn.execute("DELETE FROM products")
+        insert_product_rows(conn, products)
+        conn.commit()
+    mirror_products_to_csv(products)
+
+
+
+
+# ============================================================
+# PRICEBOT_SAFE_SAVE_PRODUCTS_GUARD_V1
+# حماية حفظ المنتجات من التلف أثناء الرفع أو التعديل
+# ============================================================
+
+import threading as _pb_threading
+import shutil as _pb_shutil
+import time as _pb_time
+from pathlib import Path as _pb_Path
+
+_PRICEBOT_PRODUCTS_SAVE_LOCK_V1 = _pb_threading.RLock()
+
+def _pricebot_backup_product_files_v1():
+    base = _pb_Path(globals().get("APP_DIR", _pb_Path(__file__).resolve().parent))
+    backup_dir = base / "backups"
+    backup_dir.mkdir(exist_ok=True)
+
+    ts = _pb_time.strftime("%Y%m%d_%H%M%S")
+    saved = []
+
+    candidates = []
+
+    for name in [
+        "DB_FILE", "DB_PATH", "DATABASE_FILE", "PRODUCTS_DB",
+        "PRODUCTS_FILE", "PRODUCTS_CSV", "PRODUCTS_JSON"
+    ]:
+        val = globals().get(name)
+        if val:
+            candidates.append(_pb_Path(str(val)))
+
+    candidates += [
+        base / "pricebot.db",
+        base / "products.db",
+        base / "products.csv",
+        base / "products.json",
+    ]
+
+    seen = set()
+    for src in candidates:
+        try:
+            src = src if src.is_absolute() else base / src
+            key = str(src.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if src.exists() and src.is_file():
+                dst = backup_dir / f"{src.name}.before_save_products_{ts}.bak"
+                _pb_shutil.copy2(src, dst)
+                saved.append((src, dst))
+        except Exception:
+            pass
+
+    return saved
+
+def _pricebot_restore_product_files_v1(saved):
+    for src, dst in saved:
+        try:
+            if dst.exists():
+                _pb_shutil.copy2(dst, src)
+        except Exception:
+            pass
+
+def save_products(products):
+    with _PRICEBOT_PRODUCTS_SAVE_LOCK_V1:
+        if products is None:
+            raise ValueError("Refusing to save None products")
+
+        if not isinstance(products, list):
+            raise ValueError("Products must be a list")
+
+        before_count = 0
+        try:
+            before_count = len(load_products())
+        except Exception:
+            before_count = 0
+
+        # حماية من ملف فارغ يمسح كل شيء بالغلط
+        if before_count > 0 and len(products) == 0:
+            raise ValueError("Refusing to replace existing products with empty list")
+
+        saved = _pricebot_backup_product_files_v1()
+
+        try:
+            result = _pricebot_original_save_products(products)
+
+            try:
+                after_count = len(load_products())
+            except Exception:
+                after_count = 0
+
+            if before_count > 0 and after_count == 0:
+                raise RuntimeError("save_products resulted in zero products; restored backup")
+
+            return result
+
+        except Exception:
+            _pricebot_restore_product_files_v1(saved)
+            raise
+
+print("PRICEBOT_SAFE_SAVE_PRODUCTS_GUARD_V1 loaded")
+
+
+def backup_file(path: Path) -> Optional[Path]:
+    if not path.exists():
+        return None
+    backup = path.with_name(f"{path.name}.bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    shutil.copy2(path, backup)
+    return backup
+
+
+def product_key(name: str) -> str:
+    return normalize(name)
+
+
+def upsert_product(new_item: dict) -> Tuple[List[dict], str]:
+    products = load_products()
+    key = product_key(new_item.get("name", ""))
+    for item in products:
+        if product_key(item.get("name", "")) == key:
+            item.update(new_item)
+            save_products(products)
+            return products, "updated"
+    products.append(new_item)
+    save_products(products)
+    return products, "added"
+
+
+
+def extract_product_query(text: str) -> str:
+    """Turn natural customer wording into a product-focused query without removing useful form/strength words."""
+    q = normalize(text)
+    if not q:
+        return ""
+
+    phrase_replacements = [
+        "السلام عليكم", "السلام", "مرحبا", "اهلا", "اهلين", "لو سمحت", "من فضلك", "بالله",
+        "كم سعر", "شن سعر", "شنو سعر", "بكم", "قداش", "السعر", "سعر",
+        "عندكم", "موجود", "موجوده", "متوفر", "متوفره", "هل يوجد", "هل عندكم",
+        "اريد", "نريد", "نبي", "ابي", "ابغى", "ممكن", "عطيني", "احتاج",
+        "الصيدليه", "الصيدلية", "بدر", "البشرية", "البشريه",
+        "do you have", "have", "price", "how much", "need", "want", "please",
+    ]
+    for phrase in sorted(phrase_replacements, key=len, reverse=True):
+        q = q.replace(normalize(phrase), " ")
+
+    # Keep useful identifiers like 250/500/400, extra/advance, شراب/تحاميل/كريم.
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
+def search_tokens(text: str) -> List[str]:
+    q = normalize(text or "")
+    # normalize common strengths so 400 matches 400mg / 400 مجم / 400 ملغ.
+    q = re.sub(r"(\d+)\s*(mg|مجم|ملغ|مغ|ملجم|g|جم|mcg|ميكرو)", r"\1", q)
+    raw = [t for t in q.split() if len(t) > 1]
+    out: List[str] = []
+    for t in raw:
+        if t not in out:
+            out.append(t)
+        # Also extract digits from mixed tokens like 400mg.
+        m = re.search(r"\d+", t)
+        if m and m.group(0) not in out:
+            out.append(m.group(0))
+    return out
+
+
+def product_full_search_text(item: dict) -> str:
+    parts = []
+    for field in ["name", "aliases", "active_ingredient", "brand", "company", "form", "strength", "pack", "notes"]:
+        val = str(item.get(field, "") or "").strip()
+        if val:
+            parts.append(val)
+    return " ".join(parts)
+
+
+def match_score(query: str, keyword: str) -> float:
+    q = normalize(query)
+    k = normalize(keyword)
+    if not q or not k:
+        return 0.0
+    if q == k:
+        return 1.0
+
+    q_tokens = search_tokens(q)
+    k_tokens = search_tokens(k)
+    q_set, k_set = set(q_tokens), set(k_tokens)
+
+    # If the customer query is more specific and fully contained in the product text,
+    # prefer that product over a shorter generic one. Example: بروفين 400 > بروفين.
+    if q_set and k_set:
+        shared = len(q_set & k_set)
+        if q_set <= k_set:
+            return 0.99
+        if k_set <= q_set:
+            # keyword is generic inside a longer query; useful but not the best if a specific option exists.
+            return 0.88 if len(k_set) < len(q_set) else 0.96
+        overlap = shared / max(len(q_set), len(k_set), 1)
+        if overlap >= 0.75:
+            return 0.93
+        if overlap >= 0.50:
+            return 0.78
+
+    if q in k and len(q) >= 3:
+        return 0.94
+    if k in q and len(k) >= 3:
+        return 0.86
+
+    return SequenceMatcher(None, q, k).ratio()
+
+
+def ranked_products(text: str) -> List[Tuple[float, dict]]:
+    products = load_products()
+    candidates = [text, extract_product_query(text)]
+    seen_candidates = set()
+    candidates = [c for c in candidates if c and not (normalize(c) in seen_candidates or seen_candidates.add(normalize(c)))]
+
+    ranked: List[Tuple[float, dict]] = []
+    for item in products:
+        best_score = 0.0
+        full_text = product_full_search_text(item)
+        for candidate in candidates:
+            best_score = max(best_score, match_score(candidate, full_text))
+            # Also compare against individual strong fields for exact aliases/trade names.
+            for keyword in item.get("keywords", [item.get("name", "")]):
+                best_score = max(best_score, match_score(candidate, keyword))
+        if best_score > 0:
+            ranked.append((best_score, item))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return ranked
+
+
+def category_suggestions(text: str, limit: int = 4) -> List[dict]:
+    q = normalize(text)
+    products = load_products()
+    hints = {
+        "صداع": ["بنادول", "فيفادول", "بروفين", "باراسيتامول", "panadol", "paracetamol"],
+        "مسكن": ["بنادول", "فيفادول", "بروفين", "كتافلام", "ديكلوفيناك"],
+        "الم": ["بنادول", "فيفادول", "بروفين", "كتافلام"],
+        "حراره": ["بنادول", "فيفادول", "باراسيتامول", "panadol"],
+        "مضاد": ["أموكسيل", "اموكسيل", "أوجمنتين", "اوجمنتين", "أزيثرومايسين"],
+        "حموضه": ["جلوسيد", "اوميبرازول", "omeprazole"],
+        "معده": ["جلوسيد", "موتيليوم", "سماكتا"],
+        "اسهال": ["سماكتا"],
+        "ضغط": ["أملور", "كونكور", "كابوتين", "لازيكس"],
+    }
+    wanted: List[str] = []
+    for key, names in hints.items():
+        if normalize(key) in q:
+            wanted.extend(names)
+    if not wanted:
+        return []
+
+    result: List[dict] = []
+    for item in products:
+        haystack = normalize(" ".join([item.get("name", ""), item.get("aliases", ""), item.get("notes", "")]))
+        if any(normalize(name) in haystack for name in wanted):
+            result.append(item)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def find_product(text: str) -> Optional[dict]:
+    ranked = ranked_products(text)
+    if ranked and ranked[0][0] >= 0.76:
+        return ranked[0][1]
+    return None
+
+
+def suggested_products(text: str, limit: int = 4) -> List[dict]:
+    category = category_suggestions(text, limit=limit)
+    if category:
+        return category[:limit]
+    ranked = [item for score, item in safe_ranked_products(text, strict=False) if score >= 0.48]
+    # De-duplicate by normalized product name.
+    out: List[dict] = []
+    seen = set()
+    for item in ranked:
+        key = normalize(item.get("name", ""))
+        if key and key not in seen:
+            out.append(item)
+            seen.add(key)
+        if len(out) >= limit:
+            break
+    return out
+
+
+
+def json_from_model_text(content: str) -> dict:
+    """Extract a JSON object from an LLM answer safely."""
+    content = (content or "").strip()
+    if not content:
+        return {}
+    content = content.replace("```json", "```").strip()
+    if "```" in content:
+        parts = content.split("```")
+        # Prefer the largest fenced block.
+        content = max(parts, key=len).strip()
+    start = content.find("{")
+    end = content.rfind("}")
+    if start >= 0 and end > start:
+        content = content[start:end + 1]
+    try:
+        data = json.loads(content)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def compact_catalog_for_ai(text: str, limit: int = 80) -> List[dict]:
+    """Send a compact product catalog to the AI without leaking orders or secrets."""
+    products = load_products()
+    ranked = ranked_products(text)
+    chosen: List[dict] = []
+    seen = set()
+
+    # Start with likely local matches.
+    for score, item in ranked:
+        key = normalize(item.get("name", ""))
+        if key and key not in seen:
+            chosen.append(item)
+            seen.add(key)
+        if len(chosen) >= min(limit, 30):
+            break
+
+    # Add category suggestions.
+    for item in category_suggestions(text, limit=20):
+        key = normalize(item.get("name", ""))
+        if key and key not in seen:
+            chosen.append(item)
+            seen.add(key)
+
+    # If still little context, add beginning of catalog.
+    for item in products:
+        key = normalize(item.get("name", ""))
+        if key and key not in seen:
+            chosen.append(item)
+            seen.add(key)
+        if len(chosen) >= limit:
+            break
+
+    compact = []
+    for item in chosen[:limit]:
+        compact.append({
+            "name": item.get("name", ""),
+            "aliases": item.get("aliases", ""),
+            "active_ingredient": item.get("active_ingredient", ""),
+            "company": item.get("company", ""),
+            "form": item.get("form", ""),
+            "strength": item.get("strength", ""),
+            "pack": item.get("pack", ""),
+            "notes": item.get("notes", ""),
+        })
+    return compact
+
+
+def call_ai_once(provider: str, key: str, model: str, user_text: str, catalog: List[dict]) -> dict:
+    """Call one provider/key. Exceptions are handled by the caller."""
+    system_prompt = (
+        "أنت مساعد واتساب لصيدلية في ليبيا. مهمتك فقط فهم رسالة الزبون وتحويلها إلى JSON. "
+        "لا تعطِ تشخيصاً طبياً ولا جرعات ولا علاجاً. لا تخترع منتجات غير موجودة في الكتالوج. "
+        "لو الزبون يسأل عن سعر/توفر منتج، استخرج اسم المنتج المقصود. "
+        "لو يسأل عن جرعة/استعمال/هل يناسب حامل أو طفل، اجعل intent=medical_advice. "
+        "لو قال نعم أو حجز، intent=reservation_yes. لو قال لا أو إلغاء، intent=reservation_no. "
+        "لو كانت تحية فقط، intent=greeting. "
+        "أرجع JSON فقط بهذا الشكل: "
+        "{\"intent\":\"product_lookup|greeting|reservation_yes|reservation_no|medical_advice|unknown\","
+        "\"product_query\":\"\",\"matched_product_names\":[],\"suggested_category\":\"\"}"
+    )
+    user_prompt = json.dumps(
+        {
+            "business": business_name(),
+            "city": business_city(),
+            "message": user_text,
+            "catalog": catalog,
+        },
+        ensure_ascii=False,
+    )
+
+    if provider == "gemini":
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent?key={urllib.parse.quote(key)}"
+        payload = {
+            "contents": [
+                {"role": "user", "parts": [{"text": system_prompt + "\n\n" + user_prompt}]}
+            ],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 350},
+        }
+        headers = {"Content-Type": "application/json"}
+    else:
+        url = ai_endpoint_for(provider)
+        if not url:
+            raise RuntimeError(f"AI endpoint is missing for provider {provider}")
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 350,
+        }
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": get_config("AI_HTTP_REFERER", "https://pricebot.local"),
+            "X-Title": get_config("AI_APP_TITLE", "PriceBot"),
+        }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers=headers,
+    )
+    with urllib.request.urlopen(req, timeout=15) as response:
+        raw = response.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw)
+        if provider == "gemini":
+            content = ""
+            for cand in data.get("candidates", []):
+                for part in cand.get("content", {}).get("parts", []):
+                    if part.get("text"):
+                        content += part.get("text", "")
+        else:
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return json_from_model_text(content)
+
+
+def call_ai_json(user_text: str) -> dict:
+    """Call real external AI APIs with provider/key fallback."""
+    if not ai_enabled():
+        return {}
+
+    catalog = compact_catalog_for_ai(user_text)
+    last_error = ""
+    for provider in ai_provider_order():
+        keys = ai_keys_for_provider(provider)
+        if not keys:
+            continue
+        model = ai_model_for(provider)
+        for index, key in enumerate(keys, 1):
+            try:
+                parsed = call_ai_once(provider, key, model, user_text, catalog)
+                if parsed:
+                    print(f"AI OK: provider={provider} key_index={index} model={model} parsed={parsed}", flush=True)
+                    memory_record_ai_usage("text", provider)
+                    return parsed
+                last_error = f"{provider} key {index}: empty parse"
+                print("AI PARSE EMPTY:", last_error, flush=True)
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="ignore")[:700]
+                last_error = f"{provider} key {index}: HTTP {exc.code} {body}"
+                print("AI HTTP ERROR:", last_error, flush=True)
+                # Continue to next key/provider on quota/auth/rate-limit/model errors.
+                continue
+            except Exception as exc:
+                last_error = f"{provider} key {index}: {exc}"
+                print("AI EXCEPTION:", last_error, flush=True)
+                continue
+    print("AI FALLBACK EXHAUSTED:", last_error, flush=True)
+    return {}
+
+
+def product_by_ai_names(ai_data: dict) -> Optional[dict]:
+    names = []
+    if ai_data.get("product_query"):
+        names.append(str(ai_data.get("product_query", "")))
+    for name in ai_data.get("matched_product_names") or []:
+        if isinstance(name, str):
+            names.append(name)
+    for name in names:
+        item = exact_safe_product_match(name)
+        if item:
+            return item
+    return None
+
+
+def suggestions_from_ai(ai_data: dict, user_text: str, limit: int = 4) -> List[dict]:
+    items = []
+    seen = set()
+    names = []
+    for name in ai_data.get("matched_product_names") or []:
+        if isinstance(name, str):
+            names.append(name)
+    if ai_data.get("product_query"):
+        names.append(str(ai_data.get("product_query")))
+    if ai_data.get("suggested_category"):
+        names.append(str(ai_data.get("suggested_category")))
+    for name in names:
+        for score, product in ranked_products(name):
+            if score < 0.45:
+                continue
+            key = normalize(product.get("name", ""))
+            if key and key not in seen:
+                items.append(product)
+                seen.add(key)
+            if len(items) >= limit:
+                return items
+    for product in suggested_products(user_text, limit=limit):
+        key = normalize(product.get("name", ""))
+        if key and key not in seen:
+            items.append(product)
+            seen.add(key)
+        if len(items) >= limit:
+            break
+    return items
+
+def is_greeting(text: str) -> bool:
+    q = normalize(text)
+    greetings = ["السلام عليكم", "سلام", "مرحبا", "اهلا", "اهلين", "هاي", "hi", "hello"]
+    return any(normalize(g) in q for g in greetings) and len(q) <= 45
+
+
+
+
+
+
+def _safe_text_func(func_name: str, default: str) -> str:
+    try:
+        fn = globals().get(func_name)
+        if callable(fn):
+            val = str(fn()).strip()
+            return val or default
+    except Exception:
+        pass
+    return default
+
+
+def pharmacy_name() -> str:
+    return _safe_text_func("business_name", "صيدلية بدر البشرية")
+
+
+def pharmacy_city() -> str:
+    return _safe_text_func("business_city", "أجدابيا")
+
+
+def pharmacy_hours() -> str:
+    return _safe_text_func("business_hours", "24 ساعة")
+
+
+def pharmacy_delivery() -> str:
+    return _safe_text_func("delivery_text", "التوصيل غير متوفر حالياً")
+
+
+def is_negative_response_query(query: str) -> bool:
+    q = normalize(query or "")
+    return q in {normalize(x) for x in ["لا", "لا شكرا", "الغاء", "إلغاء", "cancel", "no"]}
+
+
+def is_positive_response_query(query: str) -> bool:
+    q = normalize(query or "")
+    return q in {normalize(x) for x in ["نعم", "اي", "تمام", "yes", "ok", "اوكي"]}
+
+
+def _product_terms(item: dict) -> list:
+    terms = []
+    name = str(item.get("name", "")).strip()
+    if name:
+        terms.append(name)
+    aliases = str(item.get("aliases", "") or "")
+    for part in re.split(r"[,،;؛|\n]+", aliases):
+        part = part.strip()
+        if part:
+            terms.append(part)
+    clean = []
+    seen = set()
+    for t in terms:
+        nt = normalize(t)
+        if nt and nt not in seen:
+            clean.append(nt)
+            seen.add(nt)
+    return clean
+
+
+def exact_product_in_text(text: str):
+    q = normalize(text or "")
+    if not q:
+        return None
+    try:
+        products = load_products()
+    except Exception:
+        products = []
+    for item in products:
+        for term in _product_terms(item):
+            if len(term) >= 2 and (q == term or term in q):
+                return item
+    return None
+
+
+
+def product_label(item: dict) -> str:
+    parts = [str(item.get("name", "")).strip()]
+    extras = []
+    for field in ["form", "strength", "pack", "company"]:
+        val = str(item.get(field, "")).strip()
+        if val and normalize(val) not in normalize(" ".join(parts + extras)):
+            extras.append(val)
+    return " - ".join([p for p in [parts[0], " / ".join(extras)] if p])
+
+
+def product_group_key(item: dict) -> str:
+    active = normalize(item.get("active_ingredient", ""))
+    strength = normalize(item.get("strength", ""))
+    form = normalize(item.get("form", ""))
+    if not active:
+        return ""
+    return "|".join([active, strength, form])
+
+
+def related_same_ingredient(item: dict, limit: int = 8) -> List[dict]:
+    key = product_group_key(item)
+    if not key:
+        return []
+    out = []
+    seen = set()
+    for p in load_products():
+        if product_group_key(p) == key:
+            name_key = normalize(p.get("name", ""))
+            if name_key and name_key not in seen:
+                out.append(p)
+                seen.add(name_key)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def query_product_matches(text: str, limit: int = 8) -> List[dict]:
+    q = extract_product_query(text) or text
+    qn = normalize(q)
+    if not qn:
+        return []
+    ranked = safe_ranked_products(q, limit=limit * 2, strict=True)
+    out = []
+    seen = set()
+    if ranked:
+        top = ranked[0][0]
+        # Specific product names need strong confirmation. Generic requests can show options.
+        if is_specific_product_query(q):
+            threshold = 0.84
+        else:
+            threshold = 0.62 if top < 0.90 else 0.72
+        for score, item in ranked:
+            if score < threshold:
+                continue
+            key = normalize(item.get("name", ""))
+            if key and key not in seen:
+                out.append(item)
+                seen.add(key)
+            if len(out) >= limit:
+                break
+    return out
+
+def should_ask_options(text: str, matches: List[dict]) -> bool:
+    if len(matches) < 2:
+        return False
+    q = normalize(extract_product_query(text) or text)
+    if not q:
+        return False
+    # Ask if the customer's text is generic and matches several variants/companies.
+    return True
+
+
+def option_choice_from_text(text: str, items: List[dict]) -> Optional[dict]:
+    q = normalize(text or "")
+    if not q:
+        return None
+    m = re.search(r"\d+", q)
+    if m:
+        idx = int(m.group(0)) - 1
+        if 0 <= idx < len(items):
+            return items[idx]
+    ranked = []
+    for item in items:
+        candidates = [product_label(item), item.get("name", ""), item.get("company", ""), item.get("brand", ""), item.get("form", ""), item.get("strength", ""), item.get("pack", ""), item.get("aliases", "")]
+        best = 0.0
+        for c in candidates:
+            if not c:
+                continue
+            best = max(best, match_score(q, str(c)))
+        ranked.append((best, item))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    if ranked and ranked[0][0] >= 0.58:
+        return ranked[0][1]
+    return None
+
+
+
+def asks_medical_advice(text: str) -> bool:
+    """
+    Strict safety gate:
+    The bot must not recommend treatment, dosage, or products for symptoms.
+    Product price/availability is allowed only when the user asks about a product without dosage/treatment advice.
+    """
+    q = normalize(text or "")
+    if not q:
+        return False
+
+    dose_or_treatment_words = [
+        "جرعه", "جرعة", "جرعات", "كم حبه", "كم حبة", "كم مره", "كم مرة",
+        "استعمل", "استخدم", "طريقة الاستخدام", "ينفع", "ينفعني", "عادي",
+        "شن ناخذ", "شن نأخذ", "ماذا اخذ", "ماذا آخذ", "نبي علاج", "ابي علاج",
+        "علاج", "دواء ل", "حاجه ل", "حاجة ل", "شن ندير", "كيف ندير",
+        "حامل", "حمل", "مرضع", "رضاعه", "رضاعة", "طفل", "رضيع",
+        "سكر", "ضغط", "حساسيه", "حساسية", "اعراض", "أعراض", "تشخيص",
+    ]
+    if any(normalize(w) in q for w in dose_or_treatment_words):
+        return True
+
+    # If the user clearly names a product and only asks price/availability, answer product info.
+    if exact_product_in_text(text or ""):
+        return False
+
+    symptom_words = [
+        "صداع", "راس", "رأس", "الم راس", "ألم راس", "وجع راس",
+        "حراره", "حرارة", "سخونه", "سخونية",
+        "كحه", "كحة", "سعال", "زكام", "رشح", "انفلونزا",
+        "اسهال", "إسهال", "مغص", "معده", "معدة", "قيء", "ترجيع",
+        "حموضه", "حموضة", "حرقان", "التهاب",
+        "الم", "ألم", "وجع", "طفح", "حكة", "حكه", "دوخه", "دوخة",
+    ]
+    return any(normalize(w) in q for w in symptom_words)
+
+
+def build_welcome_reply() -> str:
+    return (
+        f"شكراً لتواصلكم مع {pharmacy_name()} 🌿\n\n"
+        f"📍 {pharmacy_city()}\n"
+        f"🕒 العمل: {pharmacy_hours()}\n"
+        f"🚚 {pharmacy_delivery()}\n\n"
+        "يمكنك إرسال اسم الدواء أو المنتج، وسأعرض لك السعر والتوفر مباشرة.\n\n"
+        "أمثلة:\n"
+        "• بنادول\n"
+        "• بروفين\n"
+        "• أوجمنتين\n\n"
+        "ملاحظة: البوت مخصص للاستعلام عن السعر والتوفر والحجز فقط، ولا يقدم وصفات أو جرعات طبية."
+    )
+
+
+def build_medical_safety_reply(text: str = "") -> str:
+    return (
+        f"{pharmacy_name()} 🌿\n\n"
+        "حرصاً على السلامة، لا يقدم البوت تشخيصاً أو وصفات أو جرعات طبية.\n\n"
+        "يمكنني مساعدتك في:\n"
+        "• معرفة توفر دواء محدد\n"
+        "• عرض السعر\n"
+        "• تسجيل الحجز\n\n"
+        "اكتب اسم المنتج فقط للاستعلام عنه."
+    )
+
+
+
+def build_product_reply(item: dict, original_text: str = "") -> str:
+    name = str(item.get("name", "")).strip()
+    available = str(item.get("available", "") or "متوفر").strip()
+    price = str(item.get("price", "")).strip()
+    notes = str(item.get("notes", "")).strip()
+    meta = []
+    for label, field in [("الشكل", "form"), ("التركيز", "strength"), ("العبوة", "pack"), ("الشركة", "company")]:
+        val = str(item.get(field, "")).strip()
+        if val:
+            meta.append(f"{label}: {val}")
+    lines = [
+        f"{pharmacy_name()} 🌿",
+        "",
+        f"✅ المنتج: {name}",
+    ]
+    if meta:
+        lines.extend(meta)
+    lines.append(f"📦 الحالة: {available}")
+    if price:
+        lines.append(f"💰 السعر: {price}")
+    if notes:
+        lines.append(f"📝 ملاحظة: {notes}")
+    image = str(item.get("image", "")).strip()
+    if image:
+        lines.append(f"🖼️ صورة المنتج: {image}")
+
+    related = [p for p in related_same_ingredient(item) if normalize(p.get("name", "")) != normalize(item.get("name", ""))]
+    if related:
+        lines += ["", "بدائل بنفس المادة/التركيز المتوفرة في ملف الصيدلية:"]
+        for p in related[:4]:
+            lines.append(f"• {product_label(p)}")
+        lines.append("ملاحظة: اختيار البديل المناسب يتم مع الصيدلي.")
+
+    lines += ["", "للحجز اكتب: نعم"]
+    return "\n".join(lines)
+
+
+def build_options_reply(items: List[dict], reason: str = "variants") -> str:
+    intro = (
+        "متوفر ✅\\n"
+        "يوجد أكثر من خيار مطابق لطلبك.\\n"
+        "حدد المطلوب حسب الشكل الدوائي / الجرعة أو التركيز / الشركة.\\n"
+        "اكتب الرقم فقط لاختيار المطلوب:"
+    )
+    lines = [
+        f"{pharmacy_name()} 🌿",
+        "",
+        intro,
+        "",
+    ]
+    for i, item in enumerate(items[:8], 1):
+        price = str(item.get("price", "")).strip()
+        available = str(item.get("available", "") or "متوفر").strip()
+        suffix = f" — {available}"
+        if price:
+            suffix += f" — {price}"
+        lines.append(f"{i}. {product_label(item)}{suffix}")
+        image = str(item.get("image", "")).strip()
+        if image:
+            lines.append(f"   صورة: {image}")
+    lines += ["", "ملاحظة: البوت يعرض السعر والتوفر فقط ولا يحدد الجرعات أو العلاج."]
+    return "\n".join(lines)
+
+
+def build_suggestion_question(item: dict, alternatives=None) -> str:
+    alternatives = alternatives or []
+    if alternatives:
+        return build_options_reply([item] + list(alternatives), "variants")
+    name = str(item.get("name", "")).strip()
+    return "\n".join([
+        f"{pharmacy_name()} 🌿",
+        "",
+        f"هل تقصد: {name}؟",
+        "",
+        "إذا نعم اكتب: نعم",
+        "وإذا لا، أرسل اسم المنتج بشكل أوضح.",
+    ])
+
+
+def build_suggestions_reply(items, from_number: str = "", reason: str = "variants") -> str:
+    if not items:
+        return build_not_found_reply("")
+    # Multiple options: wait for number/name. One option: wait for yes.
+    if len(items) > 1:
+        if from_number:
+            PENDING_OPTIONS[from_number] = {"items": items[:8], "reason": reason}
+            PENDING_SUGGESTION.pop(from_number, None)
+        return build_options_reply(items[:8], reason)
+    first = items[0]
+    if from_number:
+        PENDING_SUGGESTION[from_number] = first
+    return build_suggestion_question(first, [])
+
+
+
+def build_not_found_reply(text: str) -> str:
+    if asks_medical_advice(text):
+        return build_medical_safety_reply(text)
+    if is_specific_product_query(text):
+        return build_unavailable_reply(text)
+    return (
+        f"{pharmacy_name()} 🌿\n\n"
+        "لم أتمكن من معرفة اسم المنتج بدقة.\n"
+        "اكتب اسم الدواء أو المنتج كما هو مكتوب على العلبة، أو أرسل صورة واضحة للمنتج.\n\n"
+        "مثال:\n"
+        "• بنادول\n"
+        "• CeraVe Foaming Cleanser\n"
+        "• أوجمنتين"
+    )
+
+
+def build_image_under_review_reply() -> str:
+    return (
+        f"{pharmacy_name()} 🌿\n\n"
+        "تم استلام الصورة وتحويلها للصيدلي للتأكيد.\n"
+        "سيتواصل معك الموظف عند مراجعتها."
+    )
+
+
+
+
+
+
+def is_available_catalog_request(text: str) -> bool:
+    q = normalize(text or "")
+    if not q:
+        return False
+    phrases = [
+        "شنو عندكم", "شن عندكم", "شنو المتوفر", "شن المتوفر", "شن الموجود",
+        "قائمه المنتجات", "قائمة المنتجات", "المنتجات المتوفره", "المنتجات المتوفرة",
+        "كل المنتجات", "الادويه المتوفره", "الأدوية المتوفرة", "ادويه متوفره",
+        "ارسل القائمة", "ابعث القائمة", "catalog", "list products"
+    ]
+    return any(normalize(p) in q for p in phrases)
+
+
+def build_available_products_reply(limit: int = 12) -> str:
+    products = [p for p in load_products() if normalize(p.get("available", "متوفر")) not in {"غير متوفر", "غير موجود", "نفذ", "ناقص"}]
+    if not products:
+        return f"{pharmacy_name()} 🌿\n\nحالياً لا توجد منتجات متوفرة مسجلة في النظام."
+    lines = [
+        f"{pharmacy_name()} 🌿",
+        "",
+        f"هذه بعض المنتجات المتوفرة حالياً ({min(limit, len(products))} من {len(products)}):",
+        "",
+    ]
+    for i, item in enumerate(products[:limit], 1):
+        price = str(item.get("price", "")).strip()
+        meta = []
+        if item.get("strength"):
+            meta.append(str(item.get("strength")))
+        if item.get("form"):
+            meta.append(str(item.get("form")))
+        suffix = ""
+        if meta:
+            suffix += " — " + " / ".join(meta)
+        if price:
+            suffix += f" — {price}"
+        lines.append(f"{i}. {item.get('name','')}{suffix}")
+    lines += [
+        "",
+        "للبحث أسرع: اكتب اسم الدواء أو المنتج المطلوب فقط."
+    ]
+    return "\n".join(lines)
+
+
+def build_order_success_reply(item: dict) -> str:
+    name = str(item.get("name", "")).strip()
+    price = str(item.get("price", "")).strip()
+    lines = [
+        "✅ تم استلام طلبك مبدئياً",
+        "",
+        f"المنتج: {name}",
+    ]
+    if price:
+        lines.append(f"السعر: {price}")
+    lines += [
+        "",
+        "الطلب بانتظار تأكيد الصيدلية. ستصلك رسالة تأكيد أو اعتذار على واتساب.",
+        f"شكراً لتواصلكم مع {pharmacy_name()}.",
+    ]
+    return "\n".join(lines)
+
+
+def customer_order_confirmed_message(row: dict) -> str:
+    lines = [
+        f"{pharmacy_name()} 🌿",
+        "",
+        "✅ تم تأكيد طلبك من الصيدلية.",
+        f"المنتج: {row.get('product','')}",
+    ]
+    if row.get("price"):
+        lines.append(f"السعر: {row.get('price')}")
+    lines += ["", "يمكنك الحضور أو انتظار تواصل الموظف حسب طريقة الاتفاق."]
+    return "\n".join(lines)
+
+
+def customer_order_rejected_message(row: dict) -> str:
+    return (
+        f"{pharmacy_name()} 🌿\n\n"
+        "نعتذر، لم يتم تأكيد طلبك حالياً بعد مراجعة الصيدلية.\n"
+        f"المنتج: {row.get('product','')}\n\n"
+        "يمكنك إرسال اسم منتج آخر للاستعلام عن التوفر والسعر."
+    )
+
+
+
+# =============================================================================
+# Product inquiry analytics
+# =============================================================================
+def log_product_inquiry(query: str, phone: str = "", product_name: str = "", found: bool = False, source: str = "", note: str = "") -> None:
+    """Record product inquiries in SQLite for daily/weekly/monthly reports."""
+    try:
+        ensure_sqlite_db()
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO product_inquiries (time, phone, query, normalized_query, product_name, found, source, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (now_str(), normalize_phone(phone), str(query or "")[:500], normalize(query or "")[:300], str(product_name or "")[:180], 1 if found else 0, str(source or "")[:80], str(note or "")[:300]),
+            )
+            conn.commit()
+    except Exception as exc:
+        print("INQUIRY LOG ERROR:", exc, flush=True)
+
+
+def inquiry_start(days: int) -> str:
+    from datetime import timedelta
+    return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def top_inquiries(days: int = 1, found: int = 1, limit: int = 5) -> List[dict]:
+    ensure_sqlite_db()
+    start = inquiry_start(days)
+    with db_connect() as conn:
+        if found:
+            rows = conn.execute(
+                """
+                SELECT product_name AS label, COUNT(*) AS count
+                FROM product_inquiries
+                WHERE time >= ? AND found = 1 AND TRIM(product_name) != ''
+                GROUP BY product_name
+                ORDER BY count DESC, product_name ASC
+                LIMIT ?
+                """,
+                (start, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT COALESCE(NULLIF(normalized_query,''), query) AS label, COUNT(*) AS count
+                FROM product_inquiries
+                WHERE time >= ? AND found = 0 AND TRIM(query) != ''
+                GROUP BY COALESCE(NULLIF(normalized_query,''), query)
+                ORDER BY count DESC, label ASC
+                LIMIT ?
+                """,
+                (start, limit),
+            ).fetchall()
+    return [{"label": str(r["label"] or ""), "count": int(r["count"] or 0)} for r in rows]
+
+
+def count_inquiries_since(days: int = 1, found: int = 1) -> int:
+    """Count product inquiries in the last N days; safe fallback to 0."""
+    try:
+        rows = top_inquiries(days=days, found=found, limit=1000)
+        total = 0
+        for row in rows or []:
+            try:
+                total += int(row.get("count", 0) or 0)
+            except Exception:
+                pass
+        return total
+    except Exception:
+        return 0
+
+
+def inquiry_count(days: int = 1, found: Optional[int] = None) -> int:
+    ensure_sqlite_db()
+    start = inquiry_start(days)
+    with db_connect() as conn:
+        if found is None:
+            return int(conn.execute("SELECT COUNT(*) FROM product_inquiries WHERE time >= ?", (start,)).fetchone()[0])
+        return int(conn.execute("SELECT COUNT(*) FROM product_inquiries WHERE time >= ? AND found = ?", (start, int(found))).fetchone()[0])
+
+
+def inquiry_cards(items: List[dict], empty: str = "لا توجد بيانات بعد") -> str:
+    if not items:
+        return f"<div class='mini-empty'>{e(empty)}</div>"
+    rows = ""
+    for i, item in enumerate(items, 1):
+        rows += f"<div class='rank-row'><span class='rank-no'>{i}</span><span class='rank-name'>{e(item.get('label'))}</span><b>{e(item.get('count'))}</b></div>"
+    return rows
+
+
+def analytics_summary() -> dict:
+    return {
+        "today_total": inquiry_count(1),
+        "today_found": inquiry_count(1, 1),
+        "today_not_found": inquiry_count(1, 0),
+        "week_total": inquiry_count(7),
+        "month_total": inquiry_count(30),
+        "today_top": top_inquiries(1, 1, 5),
+        "week_top": top_inquiries(7, 1, 5),
+        "month_top": top_inquiries(30, 1, 5),
+        "not_found": top_inquiries(30, 0, 8),
+    }
+
+
+def build_daily_report_message() -> str:
+    today = datetime.now().strftime("%Y-%m-%d")
+    orders = read_orders()
+    todays = [o for o in orders if str(o.get("time", "")).startswith(today)]
+    pending = [o for o in todays if o.get("status", "") in {"new", "pending", "review"}]
+    confirmed = [o for o in todays if o.get("status") == "confirmed"]
+    rejected = [o for o in todays if o.get("status") == "rejected"]
+    done = [o for o in todays if o.get("status") == "done"]
+    stats = analytics_summary()
+
+    def section(title: str, items: List[dict]) -> List[str]:
+        lines = ["", title]
+        if not items:
+            lines.append("لا توجد بيانات بعد.")
+        else:
+            for i, item in enumerate(items[:5], 1):
+                lines.append(f"{i}. {item.get('label','')} — {item.get('count',0)} مرة")
+        return lines
+
+    lines = [
+        f"📊 تقرير يومي - {pharmacy_name()}",
+        f"التاريخ: {today}",
+        "",
+        f"إجمالي طلبات اليوم: {len(todays)}",
+        f"بانتظار المراجعة: {len(pending)}",
+        f"مؤكدة: {len(confirmed)}",
+        f"مرفوضة: {len(rejected)}",
+        f"منفذة: {len(done)}",
+        "",
+        f"استعلامات المنتجات اليوم: {stats['today_total']}",
+        f"تم العثور على منتج: {stats['today_found']}",
+        f"لم يتم العثور: {stats['today_not_found']}",
+    ]
+    lines += section("🔥 أكثر المنتجات سؤالاً اليوم:", stats["today_top"])
+    lines += section("📅 أكثر المنتجات سؤالاً هذا الأسبوع:", stats["week_top"])
+    lines += section("🗓️ أكثر المنتجات سؤالاً هذا الشهر:", stats["month_top"])
+    lines += section("❌ أكثر الاستعلامات غير الموجودة هذا الشهر:", stats["not_found"])
+    if pending[:5]:
+        lines += ["", "أحدث الطلبات المعلقة:"]
+        for o in pending[-5:]:
+            lines.append(f"• {o.get('product','')} — {o.get('phone','')}")
+    lines += ["", "افتح لوحة الأدمن لمتابعة التفاصيل."]
+    return "\n".join(lines)
+
+
+def build_reply(text: str, from_number: str = "") -> str:
+    raw_text = text or ""
+    query = normalize(raw_text)
+    yes_words = [normalize(x) for x in ["نعم", "اي", "تمام", "yes", "ok", "اوكي"]]
+    reserve_words = [normalize(x) for x in ["حجز", "احجز", "نبي حجز", "اريد حجز", "أريد حجز"]]
+    no_words = [normalize(x) for x in ["لا", "الغاء", "إلغاء", "cancel", "no"]]
+
+    # Customer accepted cosmetic alternatives after an unavailable product.
+    if from_number and from_number in PENDING_ALT_REQUESTS:
+        pending_alt = PENDING_ALT_REQUESTS.get(from_number, {})
+        if is_positive_response_query(query):
+            items = pending_alt.get("items", [])
+            PENDING_ALT_REQUESTS.pop(from_number, None)
+            if items:
+                PENDING_OPTIONS[from_number] = {"items": items[:8], "reason": "cosmetic_alternatives"}
+                return build_options_reply(items[:8], "cosmetic_alternatives")
+        if is_negative_response_query(query):
+            PENDING_ALT_REQUESTS.pop(from_number, None)
+            return f"{pharmacy_name()} 🌿\n\nتمام. أرسل اسم منتج آخر للاستعلام."
+
+    # Customer is choosing from a numbered/variant list.
+    if from_number and from_number in PENDING_OPTIONS:
+        pending = PENDING_OPTIONS[from_number]
+        items = pending.get("items", [])
+        if is_negative_response_query(query):
+            PENDING_OPTIONS.pop(from_number, None)
+            return f"{pharmacy_name()} 🌿\n\nتمام. أرسل اسم المنتج بشكل أوضح."
+        chosen = option_choice_from_text(raw_text, items)
+        if chosen:
+            PENDING_OPTIONS.pop(from_number, None)
+            LAST_PRODUCT[from_number] = chosen
+            log_product_inquiry(raw_text, from_number, chosen.get("name", ""), True, "option_choice")
+            return build_product_reply(chosen, raw_text)
+        if is_positive_response_query(query) and len(items) > 1:
+            return f"{pharmacy_name()} 🌿\n\nاختر النوع المطلوب بكتابة الرقم من القائمة، مثال: 1"
+
+    # Customer confirmed a single suggestion.
+    if from_number and from_number in PENDING_SUGGESTION and is_positive_response_query(query):
+        item = PENDING_SUGGESTION.pop(from_number)
+        LAST_PRODUCT[from_number] = item
+        log_product_inquiry(raw_text, from_number, item.get("name", ""), True, "suggestion_confirm")
+        return build_product_reply(item, raw_text)
+
+    if from_number and from_number in PENDING_SUGGESTION and is_negative_response_query(query):
+        PENDING_SUGGESTION.pop(from_number, None)
+        return f"{pharmacy_name()} 🌿\n\nتمام. أرسل اسم المنتج بشكل أوضح."
+
+    # Confirm reservation after product details were shown.
+    if from_number and from_number in LAST_PRODUCT and is_negative_response_query(query):
+        LAST_PRODUCT.pop(from_number, None)
+        return f"{pharmacy_name()} 🌿\n\nتم إلغاء الحجز المؤقت. يمكنك كتابة اسم منتج آخر للاستعلام."
+
+    if from_number and from_number in LAST_PRODUCT and (
+        is_positive_response_query(query) or any(w in query for w in reserve_words)
+    ):
+        item = LAST_PRODUCT[from_number]
+        save_order(from_number, item, raw_text)
+        LAST_PRODUCT.pop(from_number, None)
+        PENDING_SUGGESTION.pop(from_number, None)
+        PENDING_OPTIONS.pop(from_number, None)
+        return build_order_success_reply(item)
+
+    if is_greeting(raw_text):
+        return build_welcome_reply()
+
+    if is_available_catalog_request(raw_text):
+        return build_available_products_reply()
+
+    # Persistent memory/corrections: if this wording was learned before, avoid AI.
+    corrected_item = memory_get_admin_correction(raw_text)
+    if corrected_item:
+        if from_number:
+            LAST_PRODUCT[from_number] = corrected_item
+            PENDING_SUGGESTION.pop(from_number, None)
+            PENDING_OPTIONS.pop(from_number, None)
+        return build_product_reply(corrected_item, raw_text)
+
+    # If customer asks about symptoms/dose/treatment without a named product: block.
+    if asks_medical_advice(raw_text):
+        return build_medical_safety_reply(raw_text)
+
+    # Search product variants/companies first.
+    matches = query_product_matches(raw_text, limit=8)
+    if matches:
+        # If multiple products match a generic request, ask the customer to choose.
+        if should_ask_options(raw_text, matches):
+            # Count the question as a product inquiry, but wait for customer choice before deciding exact variant.
+            log_product_inquiry(raw_text, from_number, matches[0].get("name", ""), True, "variant_list", f"options={len(matches)}")
+            return build_suggestions_reply(matches, from_number, "variants")
+
+        selected = matches[0]
+        related = related_same_ingredient(selected)
+        if len(related) > 1:
+            log_product_inquiry(raw_text, from_number, selected.get("name", ""), True, "alternatives_list", f"options={len(related)}")
+            return build_suggestions_reply(related, from_number, "same_ingredient")
+
+        if from_number:
+            LAST_PRODUCT[from_number] = selected
+            PENDING_SUGGESTION.pop(from_number, None)
+            PENDING_OPTIONS.pop(from_number, None)
+        log_product_inquiry(raw_text, from_number, selected.get("name", ""), True, "local_match")
+        return build_product_reply(selected, raw_text)
+
+    # If the customer gave a specific product identity and no safe match exists, do not let AI/local fuzzy suggestions guess.
+    if is_specific_product_query(raw_text):
+        log_product_inquiry(raw_text, from_number, "", False, "safe_not_available")
+        return build_unavailable_reply(raw_text, from_number)
+
+    cached = memory_get_query_response(raw_text)
+    if cached:
+        if cached.get("type") == "product":
+            cached_item = find_product_by_name_or_alias(cached.get("product_name", ""))
+            if cached_item:
+                if from_number:
+                    LAST_PRODUCT[from_number] = cached_item
+                    PENDING_SUGGESTION.pop(from_number, None)
+                    PENDING_OPTIONS.pop(from_number, None)
+                log_product_inquiry(raw_text, from_number, cached_item.get("name", ""), True, "memory_cache")
+                return build_product_reply(cached_item, raw_text)
+        if cached.get("type") == "options":
+            cached_items = memory_items_from_names(cached.get("product_names", []))
+            if cached_items:
+                return build_suggestions_reply(cached_items, from_number, "variants")
+
+    ai_data = call_ai_json(raw_text) if ai_enabled() else {}
+    intent = str(ai_data.get("intent", "")).strip().lower() if ai_data else ""
+    if intent == "greeting":
+        return build_welcome_reply()
+    if intent == "medical_advice":
+        return build_medical_safety_reply(raw_text)
+
+    ai_suggestions = suggestions_from_ai(ai_data, raw_text) if ai_data else []
+    if ai_suggestions:
+        if len(ai_suggestions) == 1:
+            memory_remember_product_query(raw_text, ai_suggestions[0], "ai")
+        else:
+            memory_remember_options_query(raw_text, ai_suggestions, "ai")
+        log_product_inquiry(raw_text, from_number, ai_suggestions[0].get("name", ""), True, "ai_suggestion", f"options={len(ai_suggestions)}")
+        return build_suggestions_reply(ai_suggestions, from_number, "variants")
+
+    suggestions = suggested_products(raw_text)
+    if suggestions:
+        memory_remember_options_query(raw_text, suggestions, "local_suggestion")
+        log_product_inquiry(raw_text, from_number, suggestions[0].get("name", ""), True, "local_suggestion", f"options={len(suggestions)}")
+        return build_suggestions_reply(suggestions, from_number, "variants")
+    log_product_inquiry(raw_text, from_number, "", False, "not_found")
+    return build_not_found_reply(raw_text)
+
+def send_whatsapp_message(to_number: str, message: str) -> bool:
+    token = get_access_token()
+    phone_number_id = get_phone_number_id()
+    if not token or not phone_number_id:
+        print("SEND ERROR: Missing WhatsApp token or PHONE_NUMBER_ID", flush=True)
+        return False
+
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "text",
+        "text": {"body": message},
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            print("SEND OK:", response.read().decode("utf-8"), flush=True)
+            return True
+    except urllib.error.HTTPError as exc:
+        print("SEND ERROR:", exc.code, exc.read().decode("utf-8", errors="ignore"), flush=True)
+    except Exception as exc:
+        print("SEND EXCEPTION:", str(exc), flush=True)
+    return False
+
+
+
+
+def notify_admin(message: str, customer_phone: str = "") -> bool:
+    admin_phone = admin_notify_phone()
+    customer_phone = normalize_phone(customer_phone)
+    if not admin_phone:
+        print("ADMIN NOTIFY SKIP: ADMIN_NOTIFY_PHONE not set", flush=True)
+        return False
+    if customer_phone and admin_phone == customer_phone:
+        print("ADMIN NOTIFY SKIP: admin phone equals customer phone", flush=True)
+        return False
+    return send_whatsapp_message(admin_phone, message)
+
+
+def build_admin_order_message(phone: str, item: dict, message: str) -> str:
+    return (
+        f"🔔 طلب حجز بانتظار التأكيد - {pharmacy_name()}\n\n"
+        f"رقم الزبون: {phone}\n"
+        f"المنتج: {item.get('name', '')}\n"
+        f"السعر: {item.get('price', '')}\n"
+        f"التوفر: {item.get('available', '')}\n"
+        f"ملاحظة: {item.get('notes', '')}\n"
+        f"رسالة الزبون: {message or '-'}\n"
+        f"الوقت: {now_str()}\n\n"
+        "افتح لوحة الطلبات لتأكيده أو رفضه."
+    )
+
+
+def save_review_order(phone: str, title: str, message: str, media_url: str = "") -> None:
+    item = {
+        "name": title,
+        "price": "",
+        "available": "بانتظار مراجعة الصيدلي",
+        "notes": "صورة/روشتة تحتاج تأكيد" if media_url else "تحتاج مراجعة",
+    }
+    save_order(phone, item, (message or "") + (f"\nرابط الصورة: {media_url}" if media_url else ""))
+
+
+def get_whatsapp_media_info(media_id: str) -> dict:
+    token = get_access_token()
+    if not token or not media_id:
+        return {}
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{urllib.parse.quote(media_id)}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8", errors="ignore"))
+    except Exception as exc:
+        print("MEDIA INFO ERROR:", str(exc), flush=True)
+        return {}
+
+
+def download_whatsapp_media(media_id: str) -> Tuple[bytes, str, str]:
+    info = get_whatsapp_media_info(media_id)
+    media_url = info.get("url", "")
+    mime_type = info.get("mime_type", "image/jpeg") or "image/jpeg"
+    if not media_url:
+        return b"", mime_type, ""
+    token = get_access_token()
+    req = urllib.request.Request(media_url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.read(), mime_type, info.get("sha256", "")
+    except Exception as exc:
+        print("MEDIA DOWNLOAD ERROR:", str(exc), flush=True)
+        return b"", mime_type, info.get("sha256", "")
+
+
+def save_incoming_media(media_bytes: bytes, mime_type: str, media_id: str) -> str:
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    ext = ".jpg"
+    if "png" in mime_type:
+        ext = ".png"
+    elif "webp" in mime_type:
+        ext = ".webp"
+    elif "pdf" in mime_type:
+        ext = ".pdf"
+    safe_id = re.sub(r"[^A-Za-z0-9_-]+", "", media_id or datetime.now().strftime("%Y%m%d%H%M%S"))[:80]
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_id}{ext}"
+    path = MEDIA_DIR / filename
+    path.write_bytes(media_bytes)
+    return filename
+
+
+def admin_media_url(filename: str) -> str:
+    return f"{public_base_url()}/admin/media/{urllib.parse.quote(filename)}?key={urllib.parse.quote(ADMIN_KEY)}"
+
+
+def image_ai_enabled() -> bool:
+    return bool(ai_keys_for_provider("gemini"))
+
+
+def call_gemini_vision_json(media_bytes: bytes, mime_type: str) -> dict:
+    keys = ai_keys_for_provider("gemini")
+    if not keys or not media_bytes:
+        return {}
+    model = ai_model_for("gemini") or "gemini-2.5-flash-lite"
+    catalog = compact_catalog_for_ai("صورة منتج", limit=120)
+    prompt = (
+        "أنت مساعد صيدلية. حلل الصورة وأرجع JSON فقط. "
+        "لا تقدم نصائح طبية ولا جرعات. المطلوب قراءة اسم المنتج الظاهر على العبوة فقط. "
+        "إذا كانت الصورة روشتة/وصفة طبية/ورقة بخط يد/أدوية كثيرة/صورة غير واضحة، اجعل image_type=prescription_or_unclear وrequires_admin_review=true. "
+        "إذا كانت صورة علبة منتج صيدلية أو كوزمتك واضحة، اجعل image_type=product_packaging. "
+        "استخرج الكلمات الظاهرة كما هي، ولا تخترع منتجات. لا تختار منتجاً من الكتالوج إلا إذا كان الاسم والنوع مطابقين بوضوح. "
+        "فرّق بدقة بين: cleanser/غسول، moisturizer/مرطب، cream/كريم، lotion/لوشن، serum/سيروم، sunscreen/واقي شمس، tablets/capsules/syrup/injection. "
+        "إذا ظهر Cleanser فلا تطابقه مع Moisturizer. إذا ظهر Moisturizer فلا تطابقه مع Cleanser. "
+        "الشكل المطلوب فقط: "
+        "{\"image_type\":\"product_packaging|prescription_or_unclear|unknown\",\"product_names\":[],\"visible_text\":\"\",\"brand\":\"\",\"product_type\":\"\",\"size\":\"\",\"matched_product_names\":[],\"requires_admin_review\":true|false,\"confidence\":0.0,\"clarity\":\"good|medium|bad\"} "
+        f"\nCatalog: {json.dumps(catalog, ensure_ascii=False)}"
+    )
+    b64 = base64.b64encode(media_bytes).decode("ascii")
+    for index, key in enumerate(keys, 1):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent?key={urllib.parse.quote(key)}"
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": mime_type or "image/jpeg", "data": b64}},
+                ],
+            }],
+            "generationConfig": {"temperature": 0.05, "maxOutputTokens": 500},
+        }
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method="POST", headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                raw = json.loads(response.read().decode("utf-8", errors="ignore"))
+                content = ""
+                for cand in raw.get("candidates", []):
+                    for part in cand.get("content", {}).get("parts", []):
+                        content += part.get("text", "") or ""
+                data = json_from_model_text(content)
+                if data:
+                    print(f"VISION AI OK: gemini key_index={index} parsed={data}", flush=True)
+                    memory_record_ai_usage("image", "gemini")
+                    return data
+        except urllib.error.HTTPError as exc:
+            print("VISION AI HTTP ERROR:", exc.code, exc.read().decode("utf-8", errors="ignore")[:600], flush=True)
+        except Exception as exc:
+            print("VISION AI EXCEPTION:", str(exc), flush=True)
+    return {}
+
+
+
+# =============================================================================
+# SAFE PRODUCT IDENTITY MATCHING V1
+# AI reads text/images. The database and code make the final safe decision.
+# =============================================================================
+
+COSMETIC_TYPES = {
+    "cleanser", "moisturizer", "sunscreen", "serum", "toner", "cream", "lotion",
+    "gel", "shampoo", "conditioner", "wash", "oil", "mask", "scrub"
+}
+
+TYPE_SYNONYMS = {
+    "cleanser": ["cleanser", "cleansing", "غسول", "منظف", "lavante", "gel moussant", "foaming", "wash"],
+    "moisturizer": ["moisturizer", "moisturising", "moisturizing", "moisturiser", "مرطب", "ترطيب", "hydrating cream", "hydration cream"],
+    "cream": ["cream", "creme", "crème", "كريم"],
+    "lotion": ["lotion", "لوشن"],
+    "serum": ["serum", "سيروم"],
+    "sunscreen": ["sunscreen", "sun screen", "spf", "واقي شمس", "صن سكرين"],
+    "toner": ["toner", "تونر"],
+    "gel": ["gel", "جل"],
+    "oil": ["oil", "زيت"],
+    "shampoo": ["shampoo", "شامبو"],
+    "conditioner": ["conditioner", "بلسم"],
+    "tablets": ["tab", "tabs", "tablet", "tablets", "قرص", "اقراص", "أقراص", "حبوب"],
+    "capsules": ["cap", "caps", "capsule", "capsules", "كبسول", "كبسولات"],
+    "syrup": ["syrup", "شراب"],
+    "injection": ["injection", "inj", "amp", "ampoule", "vial", "حقن", "امبول", "أمبول", "فيال"],
+    "drops": ["drop", "drops", "قطرة", "قطرات"],
+    "spray": ["spray", "بخاخ", "سبراي"],
+    "ointment": ["ointment", "مرهم"],
+}
+
+INCOMPATIBLE_TYPES = [
+    {"cleanser", "moisturizer"},
+    {"cleanser", "cream"},
+    {"cleanser", "lotion"},
+    {"serum", "cleanser"},
+    {"sunscreen", "cleanser"},
+    {"tablets", "capsules"},
+    {"tablets", "syrup"},
+    {"tablets", "injection"},
+    {"capsules", "syrup"},
+    {"capsules", "injection"},
+    {"syrup", "injection"},
+]
+
+GENERIC_PRODUCT_WORDS = {
+    "mg", "ml", "g", "gm", "kg", "plus", "extra", "advance", "new", "original",
+    "skin", "normal", "dry", "oily", "very", "for", "and", "with", "the", "to",
+    "للبشرة", "بشرة", "جافه", "جافة", "دهنيه", "دهنية", "عاديه", "عادية", "جدا", "مع", "الى", "إلى",
+    "سعر", "كم", "عندكم", "في", "موجود", "متوفر", "نبي", "ابي", "لو سمحت", "شن", "شني",
+}
+
+BRAND_HINTS = [
+    "cerave", "cera ve", "la roche", "laroche", "vichy", "bioderma", "eucerin", "avene", "uriage",
+    "isispharma", "svr", "ordinary", "the ordinary", "nivea", "neutrogena", "panadol", "brufen",
+]
+
+
+def detect_product_types(text: str) -> set:
+    q = normalize(text or "")
+    out = set()
+    if not q:
+        return out
+    for typ, words in TYPE_SYNONYMS.items():
+        for w in words:
+            if normalize(w) and normalize(w) in q:
+                out.add(typ)
+                break
+    # Cleanser has priority over generic gel/cream words in cosmetics.
+    if "cleanser" in out:
+        out.discard("gel")
+        out.discard("cream")
+    return out
+
+
+def product_identity_text(item: dict) -> str:
+    return " ".join(str(item.get(k, "") or "") for k in [
+        "name", "aliases", "active_ingredient", "brand", "company", "form", "strength", "pack", "notes"
+    ])
+
+
+def product_types(item: dict) -> set:
+    return detect_product_types(product_identity_text(item))
+
+
+def has_type_conflict(query_types: set, item_types: set) -> bool:
+    if not query_types or not item_types:
+        return False
+    for group in INCOMPATIBLE_TYPES:
+        if len(group & query_types) and len(group & item_types):
+            # Conflict only if the group contains one type from the query and a different type from the item.
+            for qt in group & query_types:
+                for it in group & item_types:
+                    if qt != it:
+                        return True
+    return False
+
+
+def extract_strong_terms(text: str) -> list:
+    raw = normalize(text or "")
+    if not raw:
+        return []
+    # Split English/Arabic and keep meaningful product identity tokens.
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9]+|[\u0600-\u06FF]{2,}|\d+\s*(?:mg|ml|g|gm)?", raw)
+    out = []
+    seen = set()
+    for tok in tokens:
+        t = normalize(tok)
+        if not t or t in GENERIC_PRODUCT_WORDS:
+            continue
+        if len(t) < 3 and not re.search(r"\d", t):
+            continue
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out[:12]
+
+
+def query_has_brand_or_type(text: str) -> bool:
+    q = normalize(text or "")
+    if detect_product_types(q):
+        return True
+    return any(normalize(b) in q for b in BRAND_HINTS)
+
+
+def is_specific_product_query(text: str) -> bool:
+    terms = extract_strong_terms(text)
+    return len(terms) >= 3 or (len(terms) >= 2 and query_has_brand_or_type(text))
+
+
+def required_terms_present(query: str, item: dict) -> bool:
+    """For specific cosmetic/product names, do not accept a nearby product that misses key words."""
+    terms = extract_strong_terms(query)
+    if len(terms) < 3:
+        return True
+    hay = normalize(product_identity_text(item))
+    query_types = detect_product_types(query)
+    # Size numbers, brand words, and product-line words are important.
+    required = []
+    for t in terms:
+        if t in GENERIC_PRODUCT_WORDS:
+            continue
+        # Do not require type synonyms by exact spelling; type conflict check handles them.
+        if any(t == normalize(w) for words in TYPE_SYNONYMS.values() for w in words):
+            continue
+        required.append(t)
+    if not required:
+        return True
+    present = sum(1 for t in required if t in hay)
+    # Strong specific query must keep most identity terms.
+    if len(required) <= 2:
+        return present == len(required)
+    return present >= max(2, len(required) - 1)
+
+
+def safe_ranked_products(text: str, limit: int = 8, strict: bool = True) -> List[Tuple[float, dict]]:
+    qtypes = detect_product_types(text)
+    ranked = ranked_products(text)
+    out = []
+    for score, item in ranked:
+        itypes = product_types(item)
+        if has_type_conflict(qtypes, itypes):
+            continue
+        if strict and is_specific_product_query(text) and not required_terms_present(text, item):
+            continue
+        out.append((score, item))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def exact_safe_product_match(text: str) -> Optional[dict]:
+    q = text or ""
+    qtypes = detect_product_types(q)
+    for score, item in safe_ranked_products(q, limit=5, strict=True):
+        if score >= 0.88:
+            if qtypes and product_types(item) and has_type_conflict(qtypes, product_types(item)):
+                continue
+            return item
+    # Exact name/alias scan with type safety.
+    nq = normalize(q)
+    for item in load_products():
+        if has_type_conflict(qtypes, product_types(item)):
+            continue
+        for term in _product_terms(item):
+            if len(term) >= 3 and (nq == term or term in nq):
+                return item
+    return None
+
+
+def cosmetic_alternatives_for_query(text: str, limit: int = 6) -> List[dict]:
+    qtypes = detect_product_types(text)
+    if not (qtypes & COSMETIC_TYPES):
+        return []
+    q = normalize(text or "")
+    terms = extract_strong_terms(text)
+    out = []
+    seen = set()
+    # Prefer same brand + same cosmetic type, then same type.
+    for require_brand in [True, False]:
+        for score, item in ranked_products(text):
+            itypes = product_types(item)
+            if not (qtypes & itypes & COSMETIC_TYPES):
+                continue
+            if has_type_conflict(qtypes, itypes):
+                continue
+            hay = normalize(product_identity_text(item))
+            if require_brand:
+                brand_ok = any(t in hay and t in q for t in terms if len(t) >= 4)
+                if not brand_ok:
+                    continue
+            key = normalize(item.get("name", ""))
+            if key and key not in seen:
+                out.append(item)
+                seen.add(key)
+            if len(out) >= limit:
+                return out
+    return out[:limit]
+
+
+def build_unavailable_reply(text: str, from_number: str = "") -> str:
+    alts = cosmetic_alternatives_for_query(text, limit=6)
+    if from_number:
+        if alts:
+            PENDING_ALT_REQUESTS[from_number] = {"query": text, "items": alts}
+        else:
+            PENDING_ALT_REQUESTS.pop(from_number, None)
+    lines = [
+        f"{pharmacy_name()} 🌿",
+        "",
+        "المنتج غير متوفر حالياً في قائمة الصيدلية.",
+    ]
+    if alts:
+        lines += ["", "توجد بدائل كوزمتك قريبة. هل تريد عرضها؟", "اكتب: نعم"]
+    return "\n".join(lines)
+
+
+def build_unclear_image_reply() -> str:
+    return (
+        f"{pharmacy_name()} 🌿\n\n"
+        "الصورة غير واضحة بما يكفي للتعرف على المنتج بدقة.\n"
+        "الرجاء إرسال صورة أوضح للواجهة الأمامية للعلبة، أو كتابة اسم المنتج كما هو مكتوب عليها."
+    )
+
+
+def build_image_unavailable_reply(product_text: str, from_number: str = "") -> str:
+    return build_unavailable_reply(product_text or "صورة منتج", from_number)
+
+def product_from_vision(data: dict) -> Optional[dict]:
+    """Return only a safe exact product match from vision data. Never guess by brand alone."""
+    names: List[str] = []
+    for key in ["product_names", "visible_text", "brand", "matched_product_names"]:
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            names.append(val.strip())
+        elif isinstance(val, list):
+            for name in val:
+                if isinstance(name, str) and name.strip():
+                    names.append(name.strip())
+    product_type = str(data.get("product_type", "") or "").strip()
+    size = str(data.get("size", "") or "").strip()
+    combined_names = []
+    for name in names:
+        combined = " ".join([name, product_type, size]).strip()
+        combined_names.append(combined)
+        combined_names.append(name)
+    seen = set()
+    for name in combined_names:
+        n = normalize(name)
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        item = exact_safe_product_match(name)
+        if item:
+            return item
+    return None
+
+def process_image_message(msg: dict, from_number: str) -> str:
+    image = msg.get("image", {}) or {}
+    media_id = image.get("id", "")
+    caption = image.get("caption", "") or ""
+    media_bytes, mime_type, media_sha = download_whatsapp_media(media_id)
+    if not media_sha and media_bytes:
+        media_sha = hashlib.sha256(media_bytes).hexdigest()
+    filename = save_incoming_media(media_bytes, mime_type, media_id) if media_bytes else ""
+    link = admin_media_url(filename) if filename else ""
+
+    if not media_bytes:
+        save_review_order(from_number, "صورة تحتاج مراجعة", "تعذر تحميل الصورة من واتساب", link)
+        notify_admin(
+            f"📷 صورة تحتاج مراجعة - {pharmacy_name()}\n\nرقم الزبون: {from_number}\nسبب التحويل: تعذر تحميل الصورة من واتساب\nالوقت: {now_str()}",
+            from_number,
+        )
+        return build_image_under_review_reply()
+
+    cached_image = memory_lookup_image(media_sha)
+    if cached_image:
+        if cached_image.get("type") == "product":
+            cached_item = find_product_by_name_or_alias(cached_image.get("product_name", ""))
+            if cached_item:
+                LAST_PRODUCT[from_number] = cached_item
+                return build_product_reply(cached_item, caption)
+        if cached_image.get("type") == "review":
+            save_review_order(from_number, "روشتة/صورة تحتاج مراجعة", f"نتيجة محفوظة من الذاكرة: {cached_image.get('reason', 'review')}", link)
+            notify_admin(
+                f"📷 صورة تحتاج مراجعة - {pharmacy_name()}\n\nرقم الزبون: {from_number}\nالسبب: نتيجة محفوظة من الذاكرة\nرابط الصورة: {link or '-'}\nالوقت: {now_str()}",
+                from_number,
+            )
+            return build_image_under_review_reply()
+
+    vision = call_gemini_vision_json(media_bytes, mime_type) if image_ai_enabled() else {}
+    image_type = str(vision.get("image_type", "")).lower()
+    requires_review = bool(vision.get("requires_admin_review"))
+    confidence = float(vision.get("confidence") or 0.0) if isinstance(vision, dict) else 0.0
+    clarity = str(vision.get("clarity", "") or "").lower() if isinstance(vision, dict) else ""
+
+    if not vision or requires_review or image_type in {"prescription_or_unclear", "unknown", ""} or clarity == "bad" or confidence < 0.55:
+        reason = "صورة غير واضحة" if confidence < 0.55 or clarity == "bad" else (image_type or "unknown")
+        memory_remember_image_review(media_sha, reason)
+        save_review_order(from_number, "صورة غير واضحة/تحتاج مراجعة", f"نوع الصورة: {reason}; vision={json.dumps(vision, ensure_ascii=False)[:600]}", link)
+        notify_admin(
+            f"📷 صورة غير واضحة أو تحتاج مراجعة - {pharmacy_name()}\n\nرقم الزبون: {from_number}\nالسبب: {reason}\nرابط الصورة: {link or '-'}\nالوقت: {now_str()}",
+            from_number,
+        )
+        return build_unclear_image_reply()
+
+    if image_type == "product_packaging":
+        item = product_from_vision(vision)
+        product_names = ", ".join([str(x) for x in (vision.get("product_names") or []) if x])
+        visible_text = str(vision.get("visible_text", "") or "")
+        product_text = " ".join([product_names, visible_text, str(vision.get("brand", "") or ""), str(vision.get("product_type", "") or ""), str(vision.get("size", "") or "")]).strip()
+        if item:
+            memory_remember_image_product(media_sha, item, "safe_gemini_vision")
+            LAST_PRODUCT[from_number] = item
+            PENDING_ALT_REQUESTS.pop(from_number, None)
+            return build_product_reply(item, caption)
+
+        # Clear product but no safe catalog match: do not guess. Say unavailable and offer cosmetic alternatives only.
+        memory_remember_image_review(media_sha, "product_not_available_safe_match")
+        save_review_order(from_number, "صورة منتج غير متوفر بالقائمة", f"الأسماء المقروءة: {product_text or '-'}", link)
+        notify_admin(
+            f"📷 منتج غير متوفر أو يحتاج إضافة - {pharmacy_name()}\n\nرقم الزبون: {from_number}\nالأسماء المقروءة: {product_text or '-'}\nرابط الصورة: {link or '-'}\nالوقت: {now_str()}",
+            from_number,
+        )
+        return build_image_unavailable_reply(product_text, from_number)
+
+    memory_remember_image_review(media_sha, image_type or "unknown")
+    save_review_order(from_number, "صورة تحتاج مراجعة", f"نوع الصورة: {image_type or 'unknown'}", link)
+    notify_admin(
+        f"📷 صورة تحتاج مراجعة - {pharmacy_name()}\n\nرقم الزبون: {from_number}\nنوع الصورة: {image_type or 'unknown'}\nرابط الصورة: {link or '-'}\nالوقت: {now_str()}",
+        from_number,
+    )
+    return build_unclear_image_reply()
+
+
+def save_order(phone: str, item: dict, message: str, status: str = "pending") -> None:
+    ensure_sqlite_db()
+    row = {
+        "time": now_str(),
+        "phone": phone,
+        "product": item.get("name", ""),
+        "price": item.get("price", ""),
+        "available": item.get("available", ""),
+        "notes": item.get("notes", ""),
+        "message": message,
+        "status": status,
+    }
+    with db_connect() as conn:
+        conn.execute(
+            f"INSERT INTO orders ({','.join(ORDER_FIELDS)}) VALUES ({','.join(['?'] * len(ORDER_FIELDS))})",
+            tuple(row.get(field, "") for field in ORDER_FIELDS),
+        )
+        conn.commit()
+    # Keep CSV mirror for easy download/backups.
+    mirror_orders_to_csv(read_orders())
+    notify_admin(build_admin_order_message(phone, item, message), phone)
+
+
+def read_orders() -> List[dict]:
+    ensure_sqlite_db()
+    migrate_legacy_files_to_db()
+    with db_connect() as conn:
+        rows = conn.execute(f"SELECT {','.join(ORDER_FIELDS)} FROM orders ORDER BY id ASC").fetchall()
+    return [{field: str(row[field] or "") for field in ORDER_FIELDS} for row in rows]
+
+
+def write_orders(rows: List[dict]) -> None:
+    ensure_sqlite_db()
+    with db_connect() as conn:
+        conn.execute("DELETE FROM orders")
+        insert_order_rows(conn, rows)
+        conn.commit()
+    mirror_orders_to_csv(rows)
+
+
+def check_admin(key: str) -> bool:
+    return bool(key) and key == ADMIN_KEY
+
+
+def safe_redirect(url: str) -> RedirectResponse:
+    return RedirectResponse(url, status_code=303)
+
+
+def e(value: object) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+BASE_CSS = """
+:root{
+  --bg:#f6f8fb; --card:#ffffff; --text:#172026; --muted:#667085; --line:#e6e9ef;
+  --brand:#0f766e; --brand2:#115e59; --soft:#ecfdf5; --danger:#b42318; --ok:#15803d;
+  --warn:#b45309; --shadow:0 10px 26px rgba(16,24,40,.08); --radius:18px;
+}
+*{box-sizing:border-box} body{margin:0;padding:18px;background:linear-gradient(180deg,#eef7f5 0,#f7f8fb 220px);color:var(--text);font-family:Arial,Tahoma,sans-serif;direction:rtl}
+a{color:var(--brand);text-decoration:none} h1{font-size:28px;margin:8px 0 12px} h2{font-size:22px;margin:4px 0 14px}.container{max-width:1180px;margin:0 auto}.hero{background:linear-gradient(135deg,#0f766e,#134e4a);color:#fff;border-radius:24px;padding:22px;box-shadow:var(--shadow);margin:6px 0 14px}.hero h1{margin:0 0 8px}.hero p{margin:0;color:#d8fffb}.box,.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin:14px 0;box-shadow:var(--shadow)}.nav{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:14px 0}.btn,a.btn,button,input[type=submit]{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;border-radius:12px;padding:12px 15px;font-size:16px;font-weight:700;background:var(--brand);color:#fff;cursor:pointer;text-align:center}.btn.secondary,a.btn.secondary{background:#fff;color:#0f5f59;border:1px solid #b9ddd8}.btn.danger,a.btn.danger{background:#fff1f0;color:var(--danger);border:1px solid #ffcbc5}.btn.ok,a.btn.ok{background:#ecfdf3;color:var(--ok);border:1px solid #bbf7d0}.btn.warn{background:#fffbeb;color:#92400e;border:1px solid #fde68a}.msg{color:var(--ok);font-weight:800;text-align:center}.notice{color:var(--muted);font-size:14px;line-height:1.9}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.field{display:flex;flex-direction:column;gap:7px}label{font-weight:800}input,textarea,select{width:100%;border:1px solid #cfd6dd;border-radius:12px;padding:12px;font-size:16px;background:#fff}textarea{min-height:180px;line-height:1.7}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.stat{background:#fff;border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:var(--shadow)}.stat b{font-size:28px;color:var(--brand)}.stat span{display:block;color:var(--muted);margin-top:4px}.product-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(285px,1fr));gap:14px}.product-title{font-size:20px;font-weight:900;margin-bottom:8px}.product-meta{color:var(--muted);font-size:14px;margin:4px 0 12px}.actions{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin-top:10px}.card-form{display:grid;gap:10px}.order-card{position:relative;display:grid;gap:8px}.badge{display:inline-flex;align-items:center;border-radius:999px;padding:5px 10px;font-weight:800;font-size:13px}.badge.new{background:#fff7ed;color:#c2410c}.badge.done{background:#ecfdf3;color:#15803d}.order-head{display:flex;justify-content:space-between;gap:10px;align-items:center;border-bottom:1px solid var(--line);padding-bottom:10px}.order-title{font-weight:900;font-size:19px}.order-row{display:flex;justify-content:space-between;gap:12px;border-bottom:1px dashed var(--line);padding:6px 0}.order-row strong{white-space:nowrap;color:#344054}.status-new{color:var(--warn);font-weight:900}.status-done{color:var(--ok);font-weight:900}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;background:#fff}th,td{border:1px solid var(--line);padding:10px;text-align:center}th{background:#f0f2f4}.admin-hint{background:#f8fafc;border:1px dashed #cbd5e1;border-radius:14px;padding:12px;color:#475569;line-height:1.8}pre{background:#0b1220;color:#e5e7eb;border-radius:14px;padding:14px;overflow:auto}
+@media(max-width:900px){.nav{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.form-grid{grid-template-columns:1fr}}
+@media(max-width:600px){body{padding:10px}h1{font-size:24px}.hero{padding:17px;border-radius:18px}.box,.card{padding:14px;border-radius:15px}.nav{grid-template-columns:1fr 1fr}.product-grid{grid-template-columns:1fr}.actions .btn,.actions button{flex:1 1 auto}.stats{grid-template-columns:1fr 1fr}.stat b{font-size:22px}}
+/* PRICEBOT_PRO_ADMIN_V3 */
+.dashboard-grid{display:grid;grid-template-columns:1.2fr .8fr;gap:16px;align-items:start}.panel-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}.panel-title h2{margin:0}.rank-list{display:grid;gap:8px}.rank-row{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:center;background:#f8fafc;border:1px solid var(--line);border-radius:14px;padding:10px 12px}.rank-no{background:#e0f2f1;color:#0f766e;border-radius:999px;width:30px;height:30px;display:flex;align-items:center;justify-content:center;font-weight:900}.rank-name{font-weight:800}.mini-empty{background:#f8fafc;border:1px dashed #cbd5e1;border-radius:14px;padding:16px;color:var(--muted);text-align:center}.kpi{background:linear-gradient(135deg,#fff,#f8fafc);border:1px solid var(--line);border-radius:20px;padding:16px;box-shadow:var(--shadow)}.kpi b{font-size:28px;display:block}.kpi span{color:var(--muted);font-weight:700}.quick-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.pro-table th{background:#ecfdf5;color:#0f5f59}.hero-pro{background:radial-gradient(circle at top right,#14b8a6 0,#0f766e 38%,#134e4a 100%)}
+@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}.quick-grid{grid-template-columns:1fr 1fr}}
+
+/* PRICEBOT_MERCHANT_PANEL_V1 */
+.merchant-hero{background:linear-gradient(135deg,#065f46,#0f766e 55%,#134e4a);color:white;border-radius:26px;padding:24px;box-shadow:var(--shadow);margin:6px 0 14px}.merchant-hero h1{margin:0 0 8px}.merchant-hero p{margin:0;color:#d8fffb}.merchant-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.merchant-tile{background:#fff;border:1px solid var(--line);border-radius:20px;padding:18px;box-shadow:var(--shadow)}.merchant-tile b{font-size:28px;display:block}.merchant-tile span{color:var(--muted);font-weight:700}.share-box{direction:ltr;text-align:left;background:#f8fafc;border:1px solid var(--line);border-radius:14px;padding:12px;font-size:15px;word-break:break-all}.qr-wrap{display:flex;gap:18px;align-items:center;flex-wrap:wrap}.qr-wrap img{background:#fff;border:1px solid var(--line);border-radius:16px;padding:10px;max-width:180px}.merchant-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.merchant-actions .btn{min-height:58px}.login-card{max-width:520px;margin:70px auto;background:#fff;border:1px solid var(--line);border-radius:24px;padding:24px;box-shadow:var(--shadow)}
+@media(max-width:800px){.merchant-grid{grid-template-columns:1fr 1fr}.merchant-actions{grid-template-columns:1fr 1fr}.qr-wrap img{max-width:150px}.login-card{margin:25px auto}}
+@media(max-width:520px){.merchant-grid{grid-template-columns:1fr}.merchant-actions{grid-template-columns:1fr}}
+
+"""
+
+
+def page_layout(title: str, body: str) -> str:
+    return f"""<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{e(title)}</title>
+  <style>{BASE_CSS}</style>
+</head>
+<body>
+  <div class="container">
+    {body}
+  </div>
+</body>
+</html>"""
+
+
+
+def admin_nav(key: str) -> str:
+    key_q = urllib.parse.quote(key)
+    return f"""
+    <div class="nav">
+      <a class="btn secondary" href="/admin?key={key_q}">📦 المنتجات</a>
+      <a class="btn secondary" href="/admin/orders?key={key_q}">🧾 الطلبات</a>
+      <a class="btn secondary" href="/admin/upload?key={key_q}">⬆️ رفع ملف</a>
+      <a class="btn secondary" href="/admin/bulk?key={key_q}">➕ إدخال بالجملة</a>
+      <a class="btn secondary" href="/admin/settings?key={key_q}">⚙️ الإعدادات</a>
+      <a class="btn secondary" href="/admin/analytics?key={key_q}">📈 الإحصائيات</a>
+      <a class="btn secondary" href="/admin/memory?key={key_q}">🧠 الذاكرة</a>
+      <a class="btn secondary" href="/admin/database?key={key_q}">🗄️ قاعدة البيانات</a>
+      <a class="btn secondary" href="/health">🟢 Health</a>
+    </div>
+    """
+
+
+def merchant_code() -> str:
+    return get_config("MERCHANT_CODE", "BADR2026").strip() or "BADR2026"
+
+
+def check_merchant(code: str) -> bool:
+    code = str(code or "").strip()
+    return bool(code) and (code == merchant_code() or code == ADMIN_KEY)
+
+
+def merchant_forbidden() -> HTMLResponse:
+    return HTMLResponse(page_layout("دخول التاجر", merchant_login_html("الرمز غير صحيح")), status_code=403)
+
+
+def customer_whatsapp_number() -> str:
+    # This is the public WhatsApp number customers will open. Keep digits only, no plus sign.
+    return normalize_phone(get_config("CUSTOMER_WHATSAPP_NUMBER", "218918874659")) or "218918874659"
+
+
+def customer_whatsapp_link() -> str:
+    phone = customer_whatsapp_number()
+    return f"https://wa.me/{phone}?text={urllib.parse.quote('السلام عليكم')}"
+
+
+def merchant_nav(code: str) -> str:
+    code_q = urllib.parse.quote(code)
+    return f"""
+    <div class="nav">
+      <a class="btn secondary" href="/merchant?code={code_q}">🏠 الرئيسية</a>
+      <a class="btn secondary" href="/merchant/orders?code={code_q}">🧾 الطلبات</a>
+      <a class="btn secondary" href="/merchant/products?code={code_q}">📦 المنتجات</a>
+      <a class="btn secondary" href="/merchant/upload?code={code_q}">⬆️ رفع ملف</a>
+      <a class="btn secondary" href="/merchant/analytics?code={code_q}">📈 الإحصائيات</a>
+      <a class="btn secondary" href="/merchant/settings?code={code_q}">⚙️ الإعدادات</a>
+      <a class="btn secondary" href="/merchant/share?code={code_q}">🔗 رابط الزبائن</a>
+    </div>
+    """
+
+
+def merchant_login_html(msg: str = "") -> str:
+    return f"""
+    <div class="login-card">
+      <h1>لوحة التاجر</h1>
+      <p class="notice">أدخل رمز المحل للدخول إلى الطلبات والمنتجات والإحصائيات.</p>
+      <p class="msg">{e(msg)}</p>
+      <form method="get" action="/merchant">
+        <div class="field"><label>رمز الدخول</label><input name="code" placeholder="مثال: BADR2026" autofocus required></div>
+        <div class="actions"><button type="submit">دخول</button></div>
+      </form>
+    </div>
+    """
+
+
+def merchant_status_ar(s: str) -> str:
+    return {
+        "pending": "بانتظار التأكيد",
+        "new": "جديد",
+        "review": "يحتاج مراجعة",
+        "confirmed": "مؤكد",
+        "rejected": "مرفوض",
+        "done": "منفذ",
+    }.get(s or "pending", s or "بانتظار")
+
+
+def merchant_badge_class(s: str) -> str:
+    if s in {"confirmed", "done"}:
+        return "done"
+    if s == "rejected":
+        return "danger"
+    return "new"
+
+
+# =============================================================================
+# Merchant Panel Routes - clean final version
+# =============================================================================
+# PRICEBOT_FINAL_MERCHANT_ROUTES_V2
+
+@app.get("/merchant/login")
+def merchant_login(msg: str = ""):
+    return HTMLResponse(page_layout("لوحة التاجر", merchant_login_html(msg)))
+
+
+@app.get("/merchant")
+def merchant_home(code: str = ""):
+    if not check_merchant(code):
+        return merchant_forbidden()
+
+    orders = read_orders()
+    products = load_products()
+    pending_count = len([o for o in orders if (o.get("status") or "pending") in {"pending", "new", "review"}])
+    confirmed_count = len([o for o in orders if (o.get("status") or "") == "confirmed"])
+    done_count = len([o for o in orders if (o.get("status") or "") == "done"])
+    link = customer_whatsapp_link()
+
+    try:
+        top_today = top_inquiries(1, 1, 5)
+    except Exception:
+        top_today = []
+
+    top_html = "".join(
+        f"<div class='rank-row'><span class='rank-no'>{i}</span><span class='rank-name'>{e(row.get('product_name',''))}</span><b>{e(str(row.get('count','')))}</b></div>"
+        for i, row in enumerate(top_today, 1)
+    ) or "<div class='mini-empty'>لا توجد استعلامات كافية اليوم.</div>"
+
+    body = f"""
+    <div class="merchant-hero">
+      <h1>لوحة التاجر</h1>
+      <p>{e(business_name())} — الطلبات والمنتجات والإحصائيات ورابط الزبائن.</p>
+    </div>
+    {merchant_nav(code)}
+
+    <div class="merchant-grid">
+      <div class="merchant-tile"><b>{pending_count}</b><span>بانتظار التأكيد</span></div>
+      <div class="merchant-tile"><b>{confirmed_count}</b><span>طلبات مؤكدة</span></div>
+      <div class="merchant-tile"><b>{done_count}</b><span>طلبات منفذة</span></div>
+      <div class="merchant-tile"><b>{len(products)}</b><span>منتجات</span></div>
+      <div class="merchant-tile"><b>{count_inquiries_since(1, 1)}</b><span>استعلامات اليوم</span></div>
+      <div class="merchant-tile"><b>{count_inquiries_since(1, 0)}</b><span>غير موجود اليوم</span></div>
+    </div>
+
+    <div class="dashboard-grid">
+      <div class="box">
+        <div class="panel-title"><h2>رابط الزبائن</h2><a class="btn secondary" href="/merchant/share?code={urllib.parse.quote(code)}">QR والرابط</a></div>
+        <p class="notice">هذا الرابط ينشره صاحب المحل في فيسبوك أو إنستغرام أو يرسله للزبائن.</p>
+        <div class="share-box">{e(link)}</div>
+        <div class="actions"><a class="btn" href="{e(link)}" target="_blank">فتح واتساب</a><a class="btn secondary" href="/merchant/orders?code={urllib.parse.quote(code)}">مراجعة الطلبات</a></div>
+      </div>
+      <div class="box">
+        <div class="panel-title"><h2>الأكثر سؤالاً اليوم</h2></div>
+        <div class="rank-list">{top_html}</div>
+      </div>
+    </div>
+    """
+    return HTMLResponse(page_layout("لوحة التاجر", body))
+
+
+@app.get("/merchant/share")
+def merchant_share(code: str = ""):
+    if not check_merchant(code):
+        return merchant_forbidden()
+
+    link = customer_whatsapp_link()
+    qr = "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" + urllib.parse.quote(link)
+    body = f"""
+    <div class="merchant-hero"><h1>رابط الزبائن</h1><p>انسخ الرابط أو استخدم QR في صفحة المحل.</p></div>
+    {merchant_nav(code)}
+    <div class="box">
+      <h2>رابط واتساب الجاهز</h2>
+      <div class="share-box">{e(link)}</div>
+      <div class="actions"><a class="btn" target="_blank" href="{e(link)}">فتح الرابط</a></div>
+      <hr>
+      <div class="qr-wrap">
+        <img src="{e(qr)}" alt="QR">
+        <div>
+          <h2>QR Code للزبائن</h2>
+          <p class="notice">يمكن طباعته أو وضعه في منشور/ستوري. عند المسح يفتح واتساب البوت مباشرة.</p>
+        </div>
+      </div>
+    </div>
+    """
+    return HTMLResponse(page_layout("رابط الزبائن", body))
+
+
+@app.get("/merchant/orders")
+def merchant_orders(code: str = "", status: str = "all", msg: str = ""):
+    if not check_merchant(code):
+        return merchant_forbidden()
+
+    all_rows = read_orders()
+    cards = []
+    for idx, row in enumerate(all_rows):
+        row_status = row.get("status") or "pending"
+        if status != "all" and row_status != status:
+            continue
+        phone = row.get("phone", "")
+        product = row.get("product", "") or "طلب"
+        price = row.get("price", "")
+        notes = row.get("notes", "") or row.get("message", "")
+        time_v = row.get("time", "")
+        phone_link = f"https://wa.me/{urllib.parse.quote(phone)}" if phone else "#"
+
+        actions = []
+        if row_status in {"pending", "new", "review", ""}:
+            actions.append(f'<a class="btn ok" href="/merchant/orders/confirm?code={urllib.parse.quote(code)}&idx={idx}" onclick="return confirm(\'تأكيد الطلب وإرسال رسالة للزبون؟\')">تأكيد للزبون</a>')
+            actions.append(f'<a class="btn danger" href="/merchant/orders/reject?code={urllib.parse.quote(code)}&idx={idx}" onclick="return confirm(\'رفض الطلب وإرسال اعتذار للزبون؟\')">رفض</a>')
+        if row_status in {"pending", "new", "review", "confirmed", ""}:
+            actions.append(f'<a class="btn secondary" href="/merchant/orders/done?code={urllib.parse.quote(code)}&idx={idx}">تم التنفيذ</a>')
+        actions.append(f'<a class="btn secondary" target="_blank" href="{phone_link}">مراسلة الزبون</a>')
+
+        cards.append(f"""
+        <div class="card order-card">
+          <div class="order-head"><div class="order-title">{e(product)}</div><span class="badge {merchant_badge_class(row_status)}">{e(merchant_status_ar(row_status))}</span></div>
+          <div class="order-row"><strong>رقم الزبون</strong><span>{e(phone)}</span></div>
+          <div class="order-row"><strong>السعر</strong><span>{e(price)}</span></div>
+          <div class="order-row"><strong>الوقت</strong><span>{e(time_v)}</span></div>
+          <div class="order-row"><strong>ملاحظة</strong><span>{e(notes)}</span></div>
+          <div class="actions">{''.join(actions)}</div>
+        </div>
+        """)
+
+    cards_html = "".join(cards) or "<div class='box'><p class='notice'>لا توجد طلبات مطابقة.</p></div>"
+    qcode = urllib.parse.quote(code)
+    body = f"""
+    <div class="merchant-hero"><h1>طلبات الزبائن</h1><p>راجع الطلبات وأكدها أو ارفضها قبل أن يعتبرها الزبون مؤكدة.</p></div>
+    {merchant_nav(code)}
+    <p class="msg">{e(msg)}</p>
+    <div class="actions">
+      <a class="btn secondary" href="/merchant/orders?code={qcode}&status=all">الكل</a>
+      <a class="btn secondary" href="/merchant/orders?code={qcode}&status=pending">بانتظار التأكيد</a>
+      <a class="btn secondary" href="/merchant/orders?code={qcode}&status=confirmed">مؤكدة</a>
+      <a class="btn secondary" href="/merchant/orders?code={qcode}&status=done">منفذة</a>
+    </div>
+    <div class="product-grid">{cards_html}</div>
+    """
+    return HTMLResponse(page_layout("طلبات التاجر", body))
+
+
+@app.get("/merchant/orders/confirm")
+def merchant_orders_confirm(code: str = "", idx: int = -1):
+    if not check_merchant(code):
+        return merchant_forbidden()
+    rows = read_orders()
+    if 0 <= idx < len(rows):
+        rows[idx]["status"] = "confirmed"
+        write_orders(rows)
+        try:
+            if rows[idx].get("phone"):
+                send_whatsapp_message(rows[idx].get("phone", ""), customer_order_confirmed_message(rows[idx]))
+        except Exception as exc:
+            print("MERCHANT CONFIRM SEND ERROR:", exc, flush=True)
+    return safe_redirect(f"/merchant/orders?code={urllib.parse.quote(code)}&msg={urllib.parse.quote('تم تأكيد الطلب وإرسال رسالة للزبون')}")
+
+
+@app.get("/merchant/orders/reject")
+def merchant_orders_reject(code: str = "", idx: int = -1):
+    if not check_merchant(code):
+        return merchant_forbidden()
+    rows = read_orders()
+    if 0 <= idx < len(rows):
+        rows[idx]["status"] = "rejected"
+        write_orders(rows)
+        try:
+            if rows[idx].get("phone"):
+                send_whatsapp_message(rows[idx].get("phone", ""), customer_order_rejected_message(rows[idx]))
+        except Exception as exc:
+            print("MERCHANT REJECT SEND ERROR:", exc, flush=True)
+    return safe_redirect(f"/merchant/orders?code={urllib.parse.quote(code)}&msg={urllib.parse.quote('تم رفض الطلب وإرسال رسالة للزبون')}")
+
+
+@app.get("/merchant/orders/done")
+def merchant_orders_done(code: str = "", idx: int = -1):
+    if not check_merchant(code):
+        return merchant_forbidden()
+    rows = read_orders()
+    if 0 <= idx < len(rows):
+        rows[idx]["status"] = "done"
+        write_orders(rows)
+    return safe_redirect(f"/merchant/orders?code={urllib.parse.quote(code)}&msg={urllib.parse.quote('تم وضع الطلب كمنفذ')}")
+
+
+@app.get("/merchant/products")
+def merchant_products(code: str = "", q: str = "", msg: str = "", page: int = 1, per_page: int = 50):
+    if not check_merchant(code):
+        return merchant_forbidden()
+
+    products = load_products()
+    nq = normalize(q)
+
+    per_page = max(10, min(int(per_page or 50), 100))
+    page = max(1, int(page or 1))
+
+    matched = []
+    for idx, item in enumerate(products):
+        hay = normalize(" ".join(str(item.get(k, "")) for k in PRODUCT_FIELDS))
+        if not nq or nq in hay:
+            matched.append((idx, item))
+
+    total = len(matched)
+    page_count = max(1, (total + per_page - 1) // per_page)
+    if page > page_count:
+        page = page_count
+
+    start = (page - 1) * per_page
+    end = start + per_page
+    shown = matched[start:end]
+
+    q_q = urllib.parse.quote(q or "")
+    code_q = urllib.parse.quote(code or "")
+    per_page_q = urllib.parse.quote(str(per_page))
+
+    def page_link(label: str, target_page: int, disabled: bool = False) -> str:
+        if disabled:
+            return f'<span class="btn secondary" style="opacity:.45;cursor:not-allowed">{e(label)}</span>'
+        return f'<a class="btn secondary" href="/merchant/products?code={code_q}&q={q_q}&page={target_page}&per_page={per_page_q}">{e(label)}</a>'
+
+    pager = f"""
+    <div class="box">
+      <div class="actions">
+        {page_link('الأول', 1, page <= 1)}
+        {page_link('السابق', max(1, page - 1), page <= 1)}
+        <span class="btn ok">صفحة {page} من {page_count}</span>
+        {page_link('التالي', min(page_count, page + 1), page >= page_count)}
+        {page_link('الأخير', page_count, page >= page_count)}
+      </div>
+      <p class="notice">المعروض الآن: {len(shown)} من {total} نتيجة. إجمالي المنتجات في القاعدة: {len(products)}.</p>
+    </div>
+    """
+
+    cards = []
+    for idx, item in shown:
+        cards.append(f"""
+        <div class="card">
+          <form method="post" action="/merchant/products/save?code={code_q}&idx={idx}&q={q_q}&page={page}&per_page={per_page}" class="card-form">
+            <div class="product-title">{e(item.get('name',''))}</div>
+            <div class="product-meta">{e(item.get('company',''))} — {e(item.get('form',''))} — {e(item.get('strength',''))}</div>
+            <div class="field"><label>السعر</label><input name="price" value="{e(item.get('price',''))}"></div>
+            <div class="field"><label>التوفر</label><input name="available" value="{e(item.get('available','متوفر'))}"></div>
+            <div class="field"><label>ملاحظات</label><input name="notes" value="{e(item.get('notes',''))}"></div>
+            <div class="actions"><button type="submit">حفظ</button></div>
+          </form>
+        </div>
+        """)
+    cards_html = "".join(cards) or "<div class='box'><p class='notice'>لا توجد منتجات مطابقة.</p></div>"
+    body = f"""
+    <div class="merchant-hero"><h1>المنتجات</h1><p>بحث وتعديل السعر والتوفر والملاحظات بدون تحميل كل المنتجات مرة واحدة.</p></div>
+    {merchant_nav(code)}
+    <p class="msg">{e(msg)}</p>
+    <div class="box">
+      <form method="get" action="/merchant/products">
+        <input type="hidden" name="code" value="{e(code)}">
+        <input type="hidden" name="page" value="1">
+        <div class="form-grid">
+          <div class="field"><label>بحث</label><input name="q" value="{e(q)}" placeholder="بنادول، بروفين 400، فلاجيل، اسم الشركة..."></div>
+          <div class="field"><label>عدد المنتجات في الصفحة</label>
+            <select name="per_page">
+              <option value="25" {'selected' if per_page == 25 else ''}>25</option>
+              <option value="50" {'selected' if per_page == 50 else ''}>50</option>
+              <option value="100" {'selected' if per_page == 100 else ''}>100</option>
+            </select>
+          </div>
+        </div>
+        <div class="actions"><button type="submit">بحث</button><a class="btn secondary" href="/merchant/products?code={code_q}">إظهار أول صفحة</a></div>
+      </form>
+    </div>
+    {pager}
+    <div class="product-grid">{cards_html}</div>
+    {pager}
+    """
+    return HTMLResponse(page_layout("منتجات التاجر", body))
+
+
+@app.post("/merchant/products/save")
+async def merchant_products_save(request: Request, code: str = "", idx: int = -1, q: str = "", page: int = 1, per_page: int = 50):
+    if not check_merchant(code):
+        return merchant_forbidden()
+    form = await request.form()
+    products = load_products()
+    if 0 <= idx < len(products):
+        products[idx]["price"] = str(form.get("price", products[idx].get("price", ""))).strip()
+        products[idx]["available"] = str(form.get("available", products[idx].get("available", "متوفر"))).strip() or "متوفر"
+        products[idx]["notes"] = str(form.get("notes", products[idx].get("notes", ""))).strip()
+        save_products(products)
+    return safe_redirect(f"/merchant/products?code={urllib.parse.quote(code)}&q={urllib.parse.quote(q or '')}&page={int(page or 1)}&per_page={int(per_page or 50)}&msg={urllib.parse.quote('تم حفظ التعديل')}")
+
+
+@app.get("/merchant/upload")
+def merchant_upload(code: str = "", msg: str = ""):
+    if not check_merchant(code):
+        return merchant_forbidden()
+    body = f"""
+    <div class="merchant-hero"><h1>رفع ملف المنتجات</h1><p>ارفع Excel أو CSV لتحديث منتجات المحل.</p></div>
+    {merchant_nav(code)}
+    <div class="box">
+      <p class="msg">{e(msg)}</p>
+      <p class="notice">يقبل CSV أو Excel xlsx/xls ويدعم عدة صفحات. توجد حماية تمنع استبدال المنتجات بملف صغير بالغلط.</p>
+      <form method="post" action="/merchant/upload/save?code={urllib.parse.quote(code)}" enctype="multipart/form-data">
+        <div class="field"><label>اختر الملف</label><input type="file" name="file" accept=".csv,.xlsx,.xls,.txt" required></div>
+        <p><label><input type="checkbox" name="replace" value="1"> استبدال كل المنتجات الحالية</label></p>
+        <p><label><input type="checkbox" name="force" value="1"> تأكيد إجباري إذا كان عدد المنتجات الجديد أقل بكثير من الحالي</label></p>
+        <button type="submit">رفع واستيراد آمن</button>
+      </form>
+    </div>
+    """
+    return HTMLResponse(page_layout("رفع المنتجات", body))
+
+
+@app.post("/merchant/upload/save")
+async def merchant_upload_save(request: Request, file: UploadFile = File(...), code: str = ""):
+    if not check_merchant(code):
+        return merchant_forbidden()
+    form = await request.form()
+    replace = form.get("replace") == "1"
+    force = form.get("force") == "1"
+    content = await file.read()
+    filename = (file.filename or "").lower()
+    try:
+        imported, source_name, candidates = parse_product_upload(content, filename)
+    except Exception as exc:
+        return safe_redirect(f"/merchant/upload?code={urllib.parse.quote(code)}&msg={urllib.parse.quote('فشل قراءة الملف: ' + str(exc))}")
+
+    current = load_products()
+    err = product_upload_safety_error(len(imported), len(current), replace, force)
+    if err:
+        return safe_redirect(f"/merchant/upload?code={urllib.parse.quote(code)}&msg={urllib.parse.quote(err)}")
+
+    products = [] if replace else current
+    products.extend(imported)
+    if replace:
+        products = dedupe_products_by_name(products)
+    save_products(products)
+    msg = f"تم استيراد {len(imported)} منتج من: {source_name}. إجمالي المنتجات الآن: {len(products)}"
+    return safe_redirect(f"/merchant/upload?code={urllib.parse.quote(code)}&msg={urllib.parse.quote(msg)}")
+
+
+@app.get("/merchant/analytics")
+def merchant_analytics(code: str = ""):
+    if not check_merchant(code):
+        return merchant_forbidden()
+
+    def block(title: str, rows: List[dict]) -> str:
+        rows_html = "".join(
+            f"<div class='rank-row'><span class='rank-no'>{i}</span><span class='rank-name'>{e(row.get('product_name',''))}</span><b>{e(str(row.get('count','')))}</b></div>"
+            for i, row in enumerate(rows, 1)
+        ) or "<div class='mini-empty'>لا توجد بيانات كافية.</div>"
+        return f"<div class='card'><div class='panel-title'><h2>{title}</h2></div><div class='rank-list'>{rows_html}</div></div>"
+
+    try:
+        today = top_inquiries(1, 1, 10)
+        week = top_inquiries(7, 1, 10)
+        month = top_inquiries(30, 1, 10)
+        not_found = top_inquiries(30, 0, 10)
+    except Exception:
+        today = week = month = not_found = []
+    body = f"""
+    <div class="merchant-hero"><h1>الإحصائيات</h1><p>اعرف أكثر المنتجات التي يسأل عنها الزبائن.</p></div>
+    {merchant_nav(code)}
+    <div class="product-grid">
+      {block('الأكثر سؤالاً اليوم', today)}
+      {block('الأكثر سؤالاً هذا الأسبوع', week)}
+      {block('الأكثر سؤالاً هذا الشهر', month)}
+      {block('أشياء لم يجدها البوت', not_found)}
+    </div>
+    """
+    return HTMLResponse(page_layout("إحصائيات التاجر", body))
+
+
+@app.get("/merchant/settings")
+def merchant_settings(code: str = "", msg: str = ""):
+    if not check_merchant(code):
+        return merchant_forbidden()
+    body = f"""
+    <div class="merchant-hero"><h1>إعدادات المحل</h1><p>تعديل البيانات التي تظهر للزبائن.</p></div>
+    {merchant_nav(code)}
+    <div class="box">
+      <p class="msg">{e(msg)}</p>
+      <form method="post" action="/merchant/settings/save?code={urllib.parse.quote(code)}">
+        <div class="form-grid">
+          <div class="field"><label>اسم المحل</label><input name="PHARMACY_NAME" value="{e(business_name())}"></div>
+          <div class="field"><label>المدينة</label><input name="PHARMACY_CITY" value="{e(business_city())}"></div>
+          <div class="field"><label>ساعات العمل</label><input name="PHARMACY_HOURS" value="{e(business_hours())}"></div>
+          <div class="field"><label>نص التوصيل</label><input name="DELIVERY_TEXT" value="{e(delivery_text())}"></div>
+          <div class="field"><label>رقم أدمن واتساب للتنبيهات</label><input name="ADMIN_NOTIFY_PHONE" value="{e(admin_notify_phone())}" placeholder="2189XXXXXXXX"></div>
+          <div class="field"><label>رقم واتساب المنشور للزبائن</label><input name="CUSTOMER_WHATSAPP_NUMBER" value="{e(customer_whatsapp_number())}" placeholder="218918874659"></div>
+        </div>
+        <p><label><input type="checkbox" name="DELIVERY_AVAILABLE" value="yes" {'checked' if delivery_enabled() else ''}> التوصيل متوفر</label></p>
+        <div class="actions"><button type="submit">حفظ الإعدادات</button></div>
+      </form>
+    </div>
+    """
+    return HTMLResponse(page_layout("إعدادات التاجر", body))
+
+
+@app.post("/merchant/settings/save")
+async def merchant_settings_save(request: Request, code: str = ""):
+    if not check_merchant(code):
+        return merchant_forbidden()
+    form = await request.form()
+    values = {
+        "PHARMACY_NAME": str(form.get("PHARMACY_NAME", business_name())).strip() or business_name(),
+        "PHARMACY_CITY": str(form.get("PHARMACY_CITY", business_city())).strip() or business_city(),
+        "PHARMACY_HOURS": str(form.get("PHARMACY_HOURS", business_hours())).strip() or business_hours(),
+        "DELIVERY_AVAILABLE": "yes" if form.get("DELIVERY_AVAILABLE") == "yes" else "no",
+        "DELIVERY_TEXT": str(form.get("DELIVERY_TEXT", delivery_text())).strip() or delivery_text(),
+        "ADMIN_NOTIFY_PHONE": normalize_phone(str(form.get("ADMIN_NOTIFY_PHONE", admin_notify_phone())).strip()),
+        "CUSTOMER_WHATSAPP_NUMBER": normalize_phone(str(form.get("CUSTOMER_WHATSAPP_NUMBER", customer_whatsapp_number())).strip()),
+    }
+    update_env_values(values)
+    for k, v in values.items():
+        os.environ[k] = v
+    return safe_redirect(f"/merchant/settings?code={urllib.parse.quote(code)}&msg={urllib.parse.quote('تم حفظ الإعدادات')}")
+
+
+@app.get("/")
+def home() -> dict:
+    return {"status": "PriceBot WhatsApp bot is running", "version": "3.1.0", "business": business_name()}
+
+
+@app.get("/health")
+def health() -> dict:
+    return {
+        "ok": True,
+        "version": "3.1.0",
+        "business": business_name(),
+        "city": business_city(),
+        "hours": business_hours(),
+        "delivery": delivery_text(),
+        "products_count": len(load_products()),
+        "orders_count": len(read_orders()),
+        "phone_number_id_set": bool(get_phone_number_id()),
+        "access_token_set": bool(get_access_token()),
+        "ai_enabled": ai_enabled(),
+        "ai_provider_order": ai_provider_order(),
+        "ai_status": ai_status_text(),
+        "ai_model": ai_model() or ai_default_model(),
+        "database": db_stats(),
+        "admin_notify_phone_set": bool(admin_notify_phone()),
+    }
+
+
+@app.get("/products")
+def products_api() -> dict:
+    return {"products": load_products()}
+
+
+
+def _pricebot_original_update_env_values(values: Dict[str, str]) -> None:
+    """Update .env atomically while preserving unrelated secrets/settings."""
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.exists() else []
+    seen = set()
+    out = []
+    for line in lines:
+        if line.strip() and not line.strip().startswith("#") and "=" in line:
+            key, _ = line.split("=", 1)
+            key = key.strip()
+            if key in values:
+                out.append(f"{key}={values[key]}")
+                seen.add(key)
+            else:
+                out.append(line)
+        else:
+            out.append(line)
+    for key, value in values.items():
+        if key not in seen:
+            out.append(f"{key}={value}")
+    tmp = ENV_FILE.with_suffix(".env.tmp")
+    tmp.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+    tmp.replace(ENV_FILE)
+
+
+
+
+
+# ============================================================
+# PRICEBOT_SAFE_ENV_WRITE_GUARD_V1
+# حماية تعديل .env من Race Condition أو تلف الملف
+# ============================================================
+
+import threading as _pb_env_threading
+import shutil as _pb_env_shutil
+import time as _pb_env_time
+from pathlib import Path as _pb_env_Path
+
+_PRICEBOT_ENV_WRITE_LOCK_V1 = _pb_env_threading.RLock()
+
+def update_env_values(values):
+    with _PRICEBOT_ENV_WRITE_LOCK_V1:
+        env_path = _pb_env_Path(globals().get("ENV_FILE", ".env"))
+
+        if not isinstance(values, dict):
+            raise ValueError("update_env_values expects dict")
+
+        backup_path = None
+
+        try:
+            if env_path.exists():
+                backup_dir = _pb_env_Path(globals().get("APP_DIR", env_path.parent)) / "backups"
+                backup_dir.mkdir(exist_ok=True)
+                ts = _pb_env_time.strftime("%Y%m%d_%H%M%S")
+                backup_path = backup_dir / f".env.before_update_{ts}.bak"
+                _pb_env_shutil.copy2(env_path, backup_path)
+
+            result = _pricebot_original_update_env_values(values)
+
+            if not env_path.exists():
+                raise RuntimeError(".env disappeared after update")
+
+            content = env_path.read_text(encoding="utf-8", errors="ignore")
+
+            if len(content.strip()) < 10:
+                raise RuntimeError(".env became too small/empty after update")
+
+            for k in values.keys():
+                if k and f"{k}=" not in content:
+                    raise RuntimeError(f".env missing updated key: {k}")
+
+            return result
+
+        except Exception:
+            if backup_path and backup_path.exists():
+                _pb_env_shutil.copy2(backup_path, env_path)
+            raise
+
+print("PRICEBOT_SAFE_ENV_WRITE_GUARD_V1 loaded")
+
+
+@app.get("/admin/settings")
+def admin_settings(key: str = "", msg: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    enabled_checked = "checked" if ai_enabled() else ""
+    order_value = ",".join(ai_provider_order())
+    admin_phone_value = admin_notify_phone()
+    body = f"""
+    <div class="hero"><h1>إعدادات {e(business_name())}</h1><p>بيانات الصيدلية، رقم تنبيهات الأدمن، والذكاء الاصطناعي.</p></div>
+    {admin_nav(key)}
+    <div class="box">
+      <p class="msg">{e(msg)}</p>
+      <form method="post" action="/admin/settings/save?key={urllib.parse.quote(key)}">
+        <h2>بيانات الصيدلية</h2>
+        <div class="form-grid">
+          <div class="field"><label>اسم الصيدلية</label><input name="PHARMACY_NAME" value="{e(business_name())}"></div>
+          <div class="field"><label>المدينة</label><input name="PHARMACY_CITY" value="{e(business_city())}"></div>
+          <div class="field"><label>ساعات العمل</label><input name="PHARMACY_HOURS" value="{e(business_hours())}"></div>
+          <div class="field"><label>نص التوصيل</label><input name="DELIVERY_TEXT" value="{e(delivery_text())}"></div>
+          <div class="field"><label>رقم أدمن واتساب للتنبيهات</label><input name="ADMIN_NOTIFY_PHONE" value="{e(admin_phone_value)}" placeholder="2189XXXXXXXX"></div>
+          <div class="field"><label>رقم واتساب المنشور للزبائن</label><input name="CUSTOMER_WHATSAPP_NUMBER" value="{e(customer_whatsapp_number())}" placeholder="218918874659"></div>
+          <div class="field"><label>رابط الموقع العام</label><input name="PUBLIC_BASE_URL" value="{e(public_base_url())}" placeholder="https://46.101.148.246.sslip.io"></div>
+        </div>
+        <p><label><input type="checkbox" name="DELIVERY_AVAILABLE" value="yes" {'checked' if delivery_enabled() else ''}> التوصيل متوفر</label></p>
+        <div class="admin-hint">رقم الأدمن يستقبل تنبيه واتساب عند تأكيد طلب أو وصول صورة/روشتة تحتاج مراجعة. لا تضع رقم الزبون هنا إلا إذا كنت تختبر فقط.</div>
+
+        <h2>الذكاء الاصطناعي المجاني/الاحتياطي</h2>
+        <p class="notice">الحالة الحالية: <b>{e(ai_status_text())}</b></p>
+        <p><label><input type="checkbox" name="AI_ENABLED" value="yes" {enabled_checked}> تفعيل AI API</label></p>
+        <div class="form-grid">
+          <div class="field"><label>ترتيب المحاولة</label><input name="AI_PROVIDER_ORDER" value="{e(order_value)}" placeholder="gemini,openrouter,groq"></div>
+          <div class="field"><label>OpenRouter model</label><input name="AI_OPENROUTER_MODEL" value="{e(ai_model_for('openrouter'))}" placeholder="openrouter/free"></div>
+          <div class="field"><label>Gemini model</label><input name="AI_GEMINI_MODEL" value="{e(ai_model_for('gemini'))}" placeholder="gemini-2.5-flash-lite"></div>
+          <div class="field"><label>Groq model</label><input name="AI_GROQ_MODEL" value="{e(ai_model_for('groq'))}" placeholder="llama-3.1-8b-instant"></div>
+        </div>
+        <p class="notice">الصق المفاتيح الجديدة فقط إذا تريد تغييرها. اترك الخانة فارغة للحفاظ على المفاتيح المحفوظة. يمكن وضع أكثر من مفتاح، كل مفتاح في سطر.</p>
+        <div class="form-grid">
+          <div class="field"><label>Gemini keys جديدة — المحفوظ: {e(masked_count_for('gemini'))}</label><textarea name="AI_GEMINI_KEYS_NEW" placeholder="AIza..."></textarea></div>
+          <div class="field"><label>OpenRouter keys جديدة — المحفوظ: {e(masked_count_for('openrouter'))}</label><textarea name="AI_OPENROUTER_KEYS_NEW" placeholder="sk-or-v1-..."></textarea></div>
+          <div class="field"><label>Groq keys جديدة — المحفوظ: {e(masked_count_for('groq'))}</label><textarea name="AI_GROQ_KEYS_NEW" placeholder="gsk_..."></textarea></div>
+          <div class="field"><label>OpenAI keys جديدة — المحفوظ: {e(masked_count_for('openai'))}</label><textarea name="AI_OPENAI_KEYS_NEW" placeholder="اختياري - اتركه فارغاً"></textarea></div>
+        </div>
+        <div class="actions"><button type="submit">حفظ الإعدادات</button><a class="btn secondary" href="/admin/settings/test?key={urllib.parse.quote(key)}&q=كم سعر البروفين؟">اختبار AI</a></div>
+      </form>
+    </div>
+    """
+    return HTMLResponse(page_layout("إعدادات PriceBot", body))
+
+@app.post("/admin/settings/save")
+async def admin_settings_save(request: Request, key: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    form = await request.form()
+    values = {
+        "PHARMACY_NAME": str(form.get("PHARMACY_NAME", business_name())).strip() or business_name(),
+        "PHARMACY_CITY": str(form.get("PHARMACY_CITY", business_city())).strip() or business_city(),
+        "PHARMACY_HOURS": str(form.get("PHARMACY_HOURS", business_hours())).strip() or business_hours(),
+        "DELIVERY_AVAILABLE": "yes" if form.get("DELIVERY_AVAILABLE") == "yes" else "no",
+        "DELIVERY_TEXT": str(form.get("DELIVERY_TEXT", delivery_text())).strip() or delivery_text(),
+        "ADMIN_NOTIFY_PHONE": normalize_phone(str(form.get("ADMIN_NOTIFY_PHONE", admin_notify_phone())).strip()),
+        "CUSTOMER_WHATSAPP_NUMBER": normalize_phone(str(form.get("CUSTOMER_WHATSAPP_NUMBER", customer_whatsapp_number())).strip()),
+        "PUBLIC_BASE_URL": str(form.get("PUBLIC_BASE_URL", public_base_url())).strip().rstrip("/") or public_base_url(),
+        "AI_ENABLED": "yes" if form.get("AI_ENABLED") == "yes" else "no",
+        "AI_PROVIDER_ORDER": str(form.get("AI_PROVIDER_ORDER", ",".join(ai_provider_order()))).strip() or "gemini,openrouter,groq",
+        "AI_OPENROUTER_MODEL": str(form.get("AI_OPENROUTER_MODEL", ai_model_for("openrouter"))).strip() or ai_default_model_for("openrouter"),
+        "AI_GEMINI_MODEL": str(form.get("AI_GEMINI_MODEL", ai_model_for("gemini"))).strip() or ai_default_model_for("gemini"),
+        "AI_GROQ_MODEL": str(form.get("AI_GROQ_MODEL", ai_model_for("groq"))).strip() or ai_default_model_for("groq"),
+        "AI_OPENAI_MODEL": str(form.get("AI_OPENAI_MODEL", ai_model_for("openai"))).strip() or ai_default_model_for("openai"),
+        "AI_CUSTOM_BASE_URL": str(form.get("AI_CUSTOM_BASE_URL", get_config("AI_CUSTOM_BASE_URL", ""))).strip(),
+    }
+    key_fields = {
+        "AI_OPENROUTER_KEYS_NEW": "AI_OPENROUTER_KEYS",
+        "AI_GEMINI_KEYS_NEW": "AI_GEMINI_KEYS",
+        "AI_GROQ_KEYS_NEW": "AI_GROQ_KEYS",
+        "AI_OPENAI_KEYS_NEW": "AI_OPENAI_KEYS",
+    }
+    for form_name, env_name in key_fields.items():
+        raw_keys = str(form.get(form_name, "")).strip()
+        if raw_keys:
+            values[env_name] = join_secret_list(raw_keys)
+    update_env_values(values)
+    # Refresh current process environment for immediate use without restart.
+    for k, v in values.items():
+        os.environ[k] = v
+    return safe_redirect(f"/admin/settings?key={urllib.parse.quote(key)}&msg={urllib.parse.quote('تم حفظ الإعدادات')}")
+
+
+@app.get("/admin/settings/test")
+def admin_settings_test(key: str = "", q: str = "كم سعر البروفين؟"):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    local_reply = build_reply(q, "")
+    ai_data = call_ai_json(q) if ai_enabled() else {"note": "AI غير مفعل أو لا يوجد مفتاح"}
+    body = f"""
+    <h1>اختبار الذكاء الاصطناعي</h1>
+    {admin_nav(key)}
+    <div class="box">
+      <form method="get" action="/admin/settings/test">
+        <input type="hidden" name="key" value="{e(key)}">
+        <div class="field"><label>رسالة اختبار</label><input name="q" value="{e(q)}"></div>
+        <div class="actions"><button type="submit">اختبار</button></div>
+      </form>
+    </div>
+    <div class="box"><h2>رد البوت</h2><pre style="white-space:pre-wrap; direction:rtl; font-size:16px">{e(local_reply)}</pre></div>
+    <div class="box"><h2>نتيجة AI JSON</h2><pre style="white-space:pre-wrap; direction:ltr; text-align:left">{e(json.dumps(ai_data, ensure_ascii=False, indent=2))}</pre></div>
+    """
+    return HTMLResponse(page_layout("اختبار AI", body))
+
+
+@app.get("/admin")
+def admin(key: str = "", msg: str = "", q: str = "", page: int = 1, per_page: int = 50):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+
+    query = normalize(q)
+    all_products = load_products()
+    orders = read_orders()
+    new_orders = [o for o in orders if (o.get("status") or "new") != "done"]
+
+    per_page = max(10, min(int(per_page or 50), 100))
+    page = max(1, int(page or 1))
+
+    indexed_products = []
+    for idx, item in enumerate(all_products):
+        hay = normalize(" ".join(str(item.get(k, "")) for k in PRODUCT_FIELDS))
+        if not query or query in hay:
+            indexed_products.append((idx, item))
+
+    total_matches = len(indexed_products)
+    page_count = max(1, (total_matches + per_page - 1) // per_page)
+    if page > page_count:
+        page = page_count
+
+    start = (page - 1) * per_page
+    end = start + per_page
+    page_products = indexed_products[start:end]
+
+    key_q = urllib.parse.quote(key or "")
+    q_q = urllib.parse.quote(q or "")
+    per_page_q = urllib.parse.quote(str(per_page))
+
+    def page_link(label: str, target_page: int, disabled: bool = False) -> str:
+        if disabled:
+            return f'<span class="btn secondary" style="opacity:.45;cursor:not-allowed">{e(label)}</span>'
+        return f'<a class="btn secondary" href="/admin?key={key_q}&q={q_q}&page={target_page}&per_page={per_page_q}">{e(label)}</a>'
+
+    pager = f"""
+    <div class="box">
+      <div class="actions">
+        {page_link('الأول', 1, page <= 1)}
+        {page_link('السابق', max(1, page - 1), page <= 1)}
+        <span class="btn ok">صفحة {page} من {page_count}</span>
+        {page_link('التالي', min(page_count, page + 1), page >= page_count)}
+        {page_link('الأخير', page_count, page >= page_count)}
+      </div>
+      <p class="notice">المعروض الآن: {len(page_products)} من {total_matches} نتيجة. إجمالي المنتجات في القاعدة: {len(all_products)}. البحث يشمل الاسم، البدائل، الشركة، الشكل، التركيز، الملاحظات وباقي حقول المنتج.</p>
+    </div>
+    """
+
+    cards = ""
+    for real_index, item in page_products:
+        cards += f"""
+        <div class="card">
+          <div class="product-title">{e(item.get('name'))}</div>
+          <div class="product-meta">💰 <b>{e(item.get('price'))}</b> &nbsp; | &nbsp; 📦 <b>{e(item.get('available'))}</b> &nbsp; | &nbsp; 💊 {e(item.get('active_ingredient'))} &nbsp; | &nbsp; {e(item.get('form'))} {e(item.get('strength'))} &nbsp; | &nbsp; 🏷️ {e(item.get('company'))}</div>
+          <form class="card-form" method="get" action="/admin/update">
+            <input type="hidden" name="key" value="{e(key)}">
+            <input type="hidden" name="idx" value="{real_index}">
+            <input type="hidden" name="q" value="{e(q)}">
+            <input type="hidden" name="page" value="{page}">
+            <input type="hidden" name="per_page" value="{per_page}">
+            <div class="form-grid">
+              <div class="field"><label>اسم المنتج</label><input name="name" value="{e(item.get('name'))}" required></div>
+              <div class="field"><label>أسماء بديلة</label><input name="aliases" value="{e(item.get('aliases'))}" placeholder="بندول, panadol"></div>
+              <div class="field"><label>السعر</label><input name="price" value="{e(item.get('price'))}"></div>
+              <div class="field"><label>التوفر</label><input name="available" value="{e(item.get('available'))}"></div>
+              <div class="field"><label>المادة الفعالة</label><input name="active_ingredient" value="{e(item.get('active_ingredient'))}" placeholder="Paracetamol"></div>
+              <div class="field"><label>الشركة/المنشأ</label><input name="company" value="{e(item.get('company'))}" placeholder="إنجليزي / أردني"></div>
+              <div class="field"><label>الشكل</label><input name="form" value="{e(item.get('form'))}" placeholder="أقراص / شراب / تحاميل"></div>
+              <div class="field"><label>التركيز</label><input name="strength" value="{e(item.get('strength'))}" placeholder="500mg"></div>
+              <div class="field"><label>العبوة</label><input name="pack" value="{e(item.get('pack'))}" placeholder="شريط / علبة"></div>
+              <div class="field"><label>صورة المنتج</label><input name="image" value="{e(item.get('image'))}" placeholder="رابط صورة اختياري"></div>
+              <div class="field"><label>ملاحظات</label><input name="notes" value="{e(item.get('notes'))}"></div>
+            </div>
+            <div class="actions"><button type="submit">حفظ</button><a class="btn danger" href="/admin/delete?key={key_q}&idx={real_index}&q={q_q}&page={page}&per_page={per_page}" onclick="return confirm('حذف المنتج؟')">حذف</a></div>
+          </form>
+        </div>
+        """
+    if not cards:
+        cards = '<div class="box notice">لا توجد منتجات مطابقة. أضف منتجًا أو ارفع ملف Excel/CSV.</div>'
+
+    body = f"""
+    <div class="hero"><h1>لوحة إدارة {e(business_name())}</h1><p>إدارة المنتجات، الطلبات، الصور، والردود الآلية.</p></div>
+    {admin_nav(key)}
+    <div class="stats">
+      <div class="stat"><b>{len(all_products)}</b><span>منتج</span></div>
+      <div class="stat"><b>{len(new_orders)}</b><span>طلبات جديدة</span></div>
+      <div class="stat"><b>{'نعم' if ai_enabled() else 'لا'}</b><span>AI مفعل</span></div>
+      <div class="stat"><b>{'نعم' if admin_notify_phone() else 'لا'}</b><span>تنبيه الأدمن</span></div>
+    </div>
+    <div class="box">
+      <p class="msg">{e(msg)}</p>
+      <form method="get" action="/admin">
+        <input type="hidden" name="key" value="{e(key)}">
+        <input type="hidden" name="page" value="1">
+        <div class="form-grid">
+          <div class="field"><label>بحث سريع عن منتج</label><input name="q" value="{e(q)}" placeholder="ابحث باسم المنتج، الاسم البديل، الشركة، التركيز، الشكل..."></div>
+          <div class="field"><label>عدد المنتجات في الصفحة</label>
+            <select name="per_page">
+              <option value="25" {'selected' if per_page == 25 else ''}>25</option>
+              <option value="50" {'selected' if per_page == 50 else ''}>50</option>
+              <option value="100" {'selected' if per_page == 100 else ''}>100</option>
+            </select>
+          </div>
+        </div>
+        <div class="actions"><button type="submit">بحث</button><a class="btn secondary" href="/admin?key={key_q}">إظهار أول صفحة</a><a class="btn ok" href="/admin/orders?key={key_q}&status=new">الطلبات الجديدة</a></div>
+      </form>
+    </div>
+    <div class="box">
+      <h2>إضافة منتج جديد</h2>
+      <form method="get" action="/admin/add">
+        <input type="hidden" name="key" value="{e(key)}">
+        <div class="form-grid">
+          <div class="field"><label>اسم المنتج</label><input name="name" placeholder="بنادول" required></div>
+          <div class="field"><label>أسماء بديلة</label><input name="aliases" placeholder="بندول, panadol"></div>
+          <div class="field"><label>السعر</label><input name="price" placeholder="5 د.ل"></div>
+          <div class="field"><label>التوفر</label><input name="available" value="متوفر"></div>
+          <div class="field"><label>المادة الفعالة</label><input name="active_ingredient" placeholder="Paracetamol"></div>
+          <div class="field"><label>الشركة/المنشأ</label><input name="company" placeholder="إنجليزي / أردني"></div>
+          <div class="field"><label>الشكل</label><input name="form" placeholder="أقراص / شراب / تحاميل"></div>
+          <div class="field"><label>التركيز</label><input name="strength" placeholder="500mg"></div>
+          <div class="field"><label>العبوة</label><input name="pack" placeholder="شريط / علبة"></div>
+          <div class="field"><label>صورة المنتج</label><input name="image" placeholder="رابط صورة اختياري"></div>
+          <div class="field"><label>ملاحظات</label><input name="notes" placeholder="اختياري"></div>
+        </div>
+        <div class="actions"><button type="submit">إضافة المنتج</button></div>
+      </form>
+    </div>
+    <h2>المنتجات الحالية ({total_matches})</h2>
+    {pager}
+    <div class="product-grid">{cards}</div>
+    {pager}
+    """
+    return HTMLResponse(page_layout("لوحة PriceBot", body))
+
+
+@app.get("/admin/add")
+def admin_add(key: str = "", name: str = "", aliases: str = "", price: str = "", available: str = "متوفر", notes: str = "", active_ingredient: str = "", company: str = "", form: str = "", strength: str = "", pack: str = "", image: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    if name.strip():
+        upsert_product({
+            "name": name.strip(), "aliases": aliases.strip(), "active_ingredient": active_ingredient.strip(),
+            "company": company.strip(), "form": form.strip(), "strength": strength.strip(), "pack": pack.strip(),
+            "price": price.strip(), "available": available.strip() or "متوفر", "notes": notes.strip(), "image": image.strip()
+        })
+        return safe_redirect(f"/admin?key={urllib.parse.quote(key)}&msg={urllib.parse.quote('تمت الإضافة أو التحديث')}")
+    return safe_redirect(f"/admin?key={urllib.parse.quote(key)}&msg={urllib.parse.quote('لم يتم إدخال اسم المنتج')}")
+
+
+@app.get("/admin/update")
+def admin_update(key: str = "", idx: int = -1, name: str = "", aliases: str = "", price: str = "", available: str = "", notes: str = "", active_ingredient: str = "", company: str = "", form: str = "", strength: str = "", pack: str = "", image: str = "", q: str = "", page: int = 1, per_page: int = 50):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    products = load_products()
+    if 0 <= idx < len(products) and name.strip():
+        products[idx] = {
+            "name": name.strip(), "aliases": aliases.strip(), "active_ingredient": active_ingredient.strip(),
+            "company": company.strip(), "form": form.strip(), "strength": strength.strip(), "pack": pack.strip(),
+            "price": price.strip(), "available": available.strip() or "متوفر", "notes": notes.strip(), "image": image.strip()
+        }
+        save_products(products)
+        msg = "تم الحفظ"
+    else:
+        msg = "لم يتم العثور على المنتج"
+    return safe_redirect(f"/admin?key={urllib.parse.quote(key)}&q={urllib.parse.quote(q or '')}&page={int(page or 1)}&per_page={int(per_page or 50)}&msg={urllib.parse.quote(msg)}")
+
+
+@app.get("/admin/delete")
+def admin_delete(key: str = "", idx: int = -1, name: str = "", q: str = "", page: int = 1, per_page: int = 50):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    products = load_products()
+    if 0 <= idx < len(products):
+        products.pop(idx)
+        save_products(products)
+        msg = "تم الحذف"
+    elif name:
+        before = len(products)
+        products = [p for p in products if p.get("name") != name]
+        save_products(products)
+        msg = "تم الحذف" if len(products) < before else "لم يتم العثور على المنتج"
+    else:
+        msg = "لم يتم تحديد المنتج"
+    return safe_redirect(f"/admin?key={urllib.parse.quote(key)}&q={urllib.parse.quote(q or '')}&page={int(page or 1)}&per_page={int(per_page or 50)}&msg={urllib.parse.quote(msg)}")
+
+
+@app.get("/admin/bulk")
+def admin_bulk(key: str = "", msg: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    sample = "بنادول,بندول|panadol,5 د.ل,متوفر,شريط\nبروفين,brufen|ibuprofen,8,متوفر,400mg"
+    body = f"""
+    <h1>إدخال منتجات بالجملة</h1>
+    {admin_nav(key)}
+    <div class="box">
+      <p class="msg">{e(msg)}</p>
+      <p class="notice">كل سطر يمكن أن يكون بالترتيب القديم: الاسم, الأسماء البديلة, السعر, التوفر, ملاحظات. وللملفات الكبيرة الأفضل استخدام قالب CSV الجديد بأعمدة المادة والشكل والتركيز والشركة. يمكن فصل الأسماء البديلة بفاصلة أو علامة |.</p>
+      <form method="post" action="/admin/bulk/save?key={urllib.parse.quote(key)}">
+        <textarea name="data" placeholder="{e(sample)}"></textarea>
+        <p><label><input type="checkbox" name="replace" value="1"> استبدال كل المنتجات الحالية</label></p>
+        <button type="submit">استيراد المنتجات</button>
+      </form>
+    </div>
+    """
+    return HTMLResponse(page_layout("إدخال منتجات بالجملة", body))
+
+
+@app.post("/admin/bulk/save")
+async def admin_bulk_save(request: Request, key: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    form = await request.form()
+    raw_data = str(form.get("data", ""))
+    replace = form.get("replace") == "1"
+    imported = parse_rows_from_text(raw_data)
+    products = [] if replace else load_products()
+    products.extend(imported)
+    save_products(products)
+    return safe_redirect(f"/admin/bulk?key={urllib.parse.quote(key)}&msg={urllib.parse.quote('تم استيراد ' + str(len(imported)) + ' منتج')}")
+
+
+def parse_rows_from_text(raw_data: str) -> List[dict]:
+    if not raw_data:
+        return []
+    rows: List[List[str]] = []
+    if "\t" in raw_data:
+        for line in raw_data.splitlines():
+            rows.append([x.strip() for x in line.split("\t")])
+    else:
+        rows = [[x.strip() for x in row] for row in csv.reader(io.StringIO(raw_data)) if row]
+    return rows_to_products(rows)
+
+
+
+def header_map(headers: List[str]) -> Dict[str, int]:
+    normalized = [normalize(h) for h in headers]
+    variants = {
+        "name": ["name", "product", "product name", "product_name", "canonical_name", "original_name", "الصنف", "اسم", "الاسم", "اسم المنتج"],
+        "aliases": ["aliases", "alias", "image_ocr_keywords", "ocr_keywords", "keywords", "اسماء بديله", "اسامي بديله", "بدائل"],
+        "active_ingredient": ["active ingredient", "active_ingredient", "ingredient", "generic", "ماده فعاله", "الماده الفعاله", "الماده", "مادة"],
+        "brand": ["brand", "brand_guess", "trade name", "trade_name", "اسم تجاري", "ماركه", "براند"],
+        "company": ["company", "company_guess", "manufacturer", "origin", "country", "الشركه", "الشركة", "المنشا", "المنشأ", "بلد", "البلد"],
+        "form": ["form", "form_or_type", "category_guess", "dosage form", "dosage_form", "shape", "الشكل", "الشكل الدوائي", "نوع", "النوع"],
+        "strength": ["strength", "strength_or_size", "size", "concentration", "dose", "تركيز", "التركيز", "جرعه", "جرعة", "عيار"],
+        "pack": ["pack", "package", "pack size", "pack_size", "عبوه", "العبوه", "التعبئه"],
+        "price": ["price", "final_price", "box_price", "strip_price", "سعر", "السعر", "سعر علبة", "سعر العلبة", "سعر شريط", "سعر الشريط"],
+        "available": ["available", "availability", "stock", "stock_status", "توفر", "التوفر", "الحاله", "متوفر"],
+        "notes": ["notes", "note", "match_policy", "review_reason", "ملاحظات", "ملاحظه"],
+        "image": ["image", "image url", "image_url", "photo", "صوره", "رابط الصوره"],
+    }
+    mapping: Dict[str, int] = {}
+    for field, names in variants.items():
+        normalized_names = [normalize(name) for name in names]
+        for idx, h in enumerate(normalized):
+            if h in normalized_names:
+                mapping[field] = idx
+                break
+    return mapping
+
+
+def _safe_cell(value) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _row_value_by_header(row: List[str], headers: List[str], *names: str, default: str = "") -> str:
+    norm_headers = [normalize(h) for h in headers]
+    for name in names:
+        n = normalize(name)
+        for idx, h in enumerate(norm_headers):
+            if h == n and idx < len(row) and str(row[idx]).strip():
+                return str(row[idx]).strip()
+    return default
+
+
+def _merge_text_parts(*parts: str) -> str:
+    seen = set()
+    out = []
+    for part in parts:
+        for bit in re.split(r"[|،,;\n]+", str(part or "")):
+            bit = bit.strip()
+            key = normalize(bit)
+            if bit and key not in seen:
+                out.append(bit)
+                seen.add(key)
+    return " | ".join(out)
+
+
+def rows_to_products(rows: List[List[str]]) -> List[dict]:
+    if not rows:
+        return []
+    headers = [str(x).strip() for x in rows[0]]
+    mapping = header_map(headers)
+    start = 1 if "name" in mapping else 0
+    imported = []
+    for row in rows[start:]:
+        row = [_safe_cell(x) for x in row]
+        if not row or not any(str(x).strip() for x in row):
+            continue
+        while len(row) < len(PRODUCT_FIELDS):
+            row.append("")
+        item = {}
+        if mapping:
+            for field in PRODUCT_FIELDS:
+                idx = mapping.get(field)
+                item[field] = row[idx].strip() if idx is not None and idx < len(row) else ""
+
+            # PriceBot normalized workbooks may contain useful OCR/search fields that
+            # do not fit the old 12-column product schema. Merge them into aliases/notes
+            # so image and text matching can use them without changing the database.
+            ocr_kw = _row_value_by_header(row, headers, "image_ocr_keywords", "ocr_keywords", "keywords")
+            original_name = _row_value_by_header(row, headers, "original_name")
+            canonical_name = _row_value_by_header(row, headers, "canonical_name")
+            category_guess = _row_value_by_header(row, headers, "category_guess")
+            form_or_type = _row_value_by_header(row, headers, "form_or_type")
+            strength_size = _row_value_by_header(row, headers, "strength_or_size")
+            final_price = _row_value_by_header(row, headers, "final_price", "box_price", "strip_price")
+
+            if canonical_name and not item.get("name"):
+                item["name"] = canonical_name
+            if ocr_kw:
+                item["aliases"] = _merge_text_parts(item.get("aliases", ""), ocr_kw)
+            if original_name and original_name != item.get("name"):
+                item["aliases"] = _merge_text_parts(item.get("aliases", ""), original_name)
+            if form_or_type:
+                item["form"] = form_or_type
+            elif category_guess and not item.get("form"):
+                item["form"] = category_guess
+            if strength_size:
+                item["strength"] = strength_size
+            if final_price:
+                item["price"] = final_price
+        else:
+            # Backward-compatible order: name, aliases, price, available, notes
+            item = {field: "" for field in PRODUCT_FIELDS}
+            item["name"] = row[0].strip() if len(row) > 0 else ""
+            item["aliases"] = row[1].strip() if len(row) > 1 else ""
+            item["price"] = row[2].strip() if len(row) > 2 else ""
+            item["available"] = row[3].strip() if len(row) > 3 else ""
+            item["notes"] = row[4].strip() if len(row) > 4 else ""
+        if not item.get("name") or normalize(item.get("name", "")) in ["name", "اسم", "الاسم", "اسم المنتج", "canonical name", "canonical_name"]:
+            continue
+        item["available"] = item.get("available") or "متوفر"
+        imported.append(item)
+    return imported
+
+
+def dedupe_products_by_name(products: List[dict]) -> List[dict]:
+    seen = set()
+    out: List[dict] = []
+    for item in products:
+        key = normalize(item.get("name", ""))
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _xlsx_rows_from_sheet(ws) -> List[List[str]]:
+    rows: List[List[str]] = []
+    for row in ws.iter_rows(values_only=True):
+        values = [_safe_cell(v) for v in row]
+        if any(values):
+            rows.append(values)
+    return rows
+
+
+def _xls_rows_from_sheet(sheet) -> List[List[str]]:
+    rows: List[List[str]] = []
+    for r in range(sheet.nrows):
+        values = [_safe_cell(sheet.cell_value(r, c)) for c in range(sheet.ncols)]
+        if any(values):
+            rows.append(values)
+    return rows
+
+
+def parse_product_upload(content: bytes, filename: str) -> Tuple[List[dict], str, List[dict]]:
+    """Parse CSV/XLSX/XLS safely.
+
+    For multi-sheet Excel files, combine product-like sheets and ignore Summary/Rules sheets.
+    This prevents the old 30-product mistake where the first workbook sheet was imported.
+    """
+    filename = (filename or "").lower()
+    candidates: List[dict] = []
+
+    def add_candidate(source: str, rows: List[List[str]]) -> None:
+        products = rows_to_products(rows)
+        header = rows[0] if rows else []
+        mapping = header_map(header) if rows else {}
+        source_norm = normalize(source)
+        ignored_names = {normalize(x) for x in ["summary", "converter_rules", "converter rules", "rules", "readme", "instructions"]}
+        score = len(products)
+        if "name" in mapping:
+            score += 500
+        if "price" in mapping:
+            score += 100
+        if source_norm in {normalize("Products_Bot_Ready"), normalize("products"), normalize("product"), normalize("منتجات")} :
+            score += 1000
+        if source_norm in ignored_names:
+            score -= 100000
+        candidates.append({"source": source, "rows": len(rows), "count": len(products), "score": score, "products": products})
+
+    if filename.endswith(".xlsx"):
+        wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            add_candidate(ws.title, _xlsx_rows_from_sheet(ws))
+    elif filename.endswith(".xls"):
+        try:
+            import xlrd  # type: ignore
+        except Exception as exc:
+            raise ValueError("ملف xls يحتاج مكتبة xlrd. ارفع xlsx أو CSV، أو ثبت xlrd.") from exc
+        book = xlrd.open_workbook(file_contents=content)
+        for sheet in book.sheets():
+            add_candidate(sheet.name, _xls_rows_from_sheet(sheet))
+    else:
+        text = content.decode("utf-8-sig", errors="ignore")
+        rows = [[x.strip() for x in row] for row in csv.reader(io.StringIO(text)) if row]
+        add_candidate("CSV", rows)
+
+    # Use all product-like sheets except obvious summary/rules sheets. If more than one
+    # product sheet exists (Products_Bot_Ready + Needs_Review), combine them.
+    good = [c for c in candidates if c["count"] > 0 and c["score"] > 0]
+    if not good:
+        best = max(candidates, key=lambda x: x.get("score", -999999), default={"source": "", "products": []})
+        return [], str(best.get("source", "")), candidates
+
+    selected = []
+    selected_sources = []
+    for c in sorted(good, key=lambda x: x["score"], reverse=True):
+        name_norm = normalize(c["source"])
+        if name_norm in {normalize("summary"), normalize("converter_rules"), normalize("converter rules")} :
+            continue
+        if c["count"] >= 20 or name_norm in {normalize("Products_Bot_Ready"), normalize("Needs_Review")} :
+            selected.extend(c["products"])
+            selected_sources.append(f"{c['source']}({c['count']})")
+
+    if not selected:
+        c = max(good, key=lambda x: x["score"])
+        selected = c["products"]
+        selected_sources = [f"{c['source']}({c['count']})"]
+
+    return dedupe_products_by_name(selected), " + ".join(selected_sources), candidates
+
+
+def product_upload_safety_error(imported_count: int, current_count: int, replace: bool, force: bool) -> str:
+    if imported_count <= 0:
+        return "لم يتم العثور على منتجات صالحة داخل الملف. لم يتم تغيير قاعدة البيانات."
+    if replace and current_count >= 100 and not force:
+        min_allowed = max(100, int(current_count * 0.70))
+        if imported_count < min_allowed:
+            return (
+                f"تم إيقاف الاستيراد لحماية المنتجات: الملف يحتوي {imported_count} منتج فقط، "
+                f"والقاعدة الحالية فيها {current_count}. لم يتم استبدال المنتجات. "
+                "إذا كنت متأكدًا أن هذا مقصود، فعّل خيار التأكيد الإجباري."
+            )
+    return ""
+
+
+@app.get("/admin/upload")
+def admin_upload_page(key: str = "", msg: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    body = f"""
+    <h1>رفع ملف منتجات {e(business_name())}</h1>
+    {admin_nav(key)}
+    <div class="box">
+      <p class="msg">{e(msg)}</p>
+      <p class="notice">يقبل CSV أو Excel xlsx/xls، ويدعم ملفات Excel متعددة الصفحات. سيختار صفحات المنتجات ويتجاهل Summary/Converter_Rules. توجد حماية تمنع استبدال 4991 منتج بملف صغير بالخطأ.</p>
+      <p><a class="btn secondary" href="/admin/template.csv?key={urllib.parse.quote(key)}">تحميل قالب CSV</a></p>
+      <form method="post" action="/admin/upload/save?key={urllib.parse.quote(key)}" enctype="multipart/form-data">
+        <div class="field"><label>اختر الملف</label><input type="file" name="file" accept=".csv,.xlsx,.xls,.txt" required></div>
+        <p><label><input type="checkbox" name="replace" value="1"> استبدال كل المنتجات الحالية</label></p>
+        <p><label><input type="checkbox" name="force" value="1"> تأكيد إجباري إذا كان عدد المنتجات الجديد أقل بكثير من الحالي</label></p>
+        <button type="submit">رفع واستيراد آمن</button>
+      </form>
+    </div>
+    """
+    return HTMLResponse(page_layout("رفع ملف المنتجات", body))
+
+
+@app.get("/admin/template.csv")
+def admin_template_csv(key: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    content = "\ufeffname,aliases,price,available,notes\nبنادول,بندول|panadol,5 د.ل,متوفر,شريط\nبروفين,brufen|ibuprofen,8,متوفر,400mg\n"
+    return PlainTextResponse(
+        content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=pricebot_products_template.csv"},
+    )
+
+
+@app.post("/admin/upload/save")
+async def admin_upload_save(request: Request, file: UploadFile = File(...), key: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    form = await request.form()
+    replace = form.get("replace") == "1"
+    force = form.get("force") == "1"
+    content = await file.read()
+    filename = (file.filename or "").lower()
+
+    try:
+        imported, source_name, candidates = parse_product_upload(content, filename)
+    except Exception as exc:
+        return safe_redirect(f"/admin/upload?key={urllib.parse.quote(key)}&msg={urllib.parse.quote('فشل قراءة الملف: ' + str(exc))}")
+
+    current = load_products()
+    err = product_upload_safety_error(len(imported), len(current), replace, force)
+    if err:
+        return safe_redirect(f"/admin/upload?key={urllib.parse.quote(key)}&msg={urllib.parse.quote(err)}")
+
+    products = [] if replace else current
+    products.extend(imported)
+    if replace:
+        products = dedupe_products_by_name(products)
+    save_products(products)
+    msg = f"تم استيراد {len(imported)} منتج من: {source_name}. إجمالي المنتجات الآن: {len(products)}"
+    return safe_redirect(f"/admin/upload?key={urllib.parse.quote(key)}&msg={urllib.parse.quote(msg)}")
+
+
+
+
+
+
+@app.get("/admin/analytics")
+def admin_analytics(key: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    key_q = urllib.parse.quote(key)
+    stats = analytics_summary()
+    orders = read_orders()
+    pending_count = sum(1 for r in orders if (r.get("status") or "pending") in {"pending", "new", "review"})
+    confirmed_count = sum(1 for r in orders if r.get("status") == "confirmed")
+    body = f"""
+    <div class="hero hero-pro"><h1>📈 مركز الإحصائيات</h1><p>{e(pharmacy_name())} — متابعة الطلب الحقيقي من الزبائن يومياً وأسبوعياً وشهرياً.</p></div>
+    {admin_nav(key)}
+    <div class="quick-grid">
+      <div class="kpi"><b>{stats['today_total']}</b><span>استعلام اليوم</span></div>
+      <div class="kpi"><b>{stats['today_found']}</b><span>منتجات تم العثور عليها</span></div>
+      <div class="kpi"><b>{stats['today_not_found']}</b><span>استعلامات غير موجودة</span></div>
+      <div class="kpi"><b>{pending_count}</b><span>طلبات بانتظار التأكيد</span></div>
+    </div>
+    <div class="dashboard-grid">
+      <div class="box">
+        <div class="panel-title"><h2>🔥 أكثر المنتجات سؤالاً اليوم</h2><a class="btn secondary" href="/admin/daily-report/send?key={key_q}">إرسال التقرير للأدمن</a></div>
+        <div class="rank-list">{inquiry_cards(stats['today_top'])}</div>
+      </div>
+      <div class="box">
+        <div class="panel-title"><h2>❌ استعلامات غير موجودة</h2></div>
+        <div class="rank-list">{inquiry_cards(stats['not_found'], 'لا توجد استعلامات غير موجودة')}</div>
+      </div>
+    </div>
+    <div class="dashboard-grid">
+      <div class="box">
+        <div class="panel-title"><h2>📅 الأكثر سؤالاً هذا الأسبوع</h2></div>
+        <div class="rank-list">{inquiry_cards(stats['week_top'])}</div>
+      </div>
+      <div class="box">
+        <div class="panel-title"><h2>🗓️ الأكثر سؤالاً هذا الشهر</h2></div>
+        <div class="rank-list">{inquiry_cards(stats['month_top'])}</div>
+      </div>
+    </div>
+    <div class="box admin-hint">
+      <b>كيف تستفيد من هذه الصفحة؟</b><br>
+      المنتجات الأكثر سؤالاً تساعدك تعرف الأصناف التي يجب توفيرها دائماً. الاستعلامات غير الموجودة تكشف الأخطاء الإملائية أو المنتجات التي يسأل عنها الزبائن وليست في الكتالوج.
+    </div>
+    """
+    return HTMLResponse(page_layout("إحصائيات PriceBot", body))
+
+@app.get("/admin/database")
+def admin_database(key: str = "", msg: str = ""):
+    if not check_admin(key):
+        return HTMLResponse("Unauthorized", status_code=401)
+    stats = db_stats()
+    key_q = urllib.parse.quote(key)
+    size_kb = round(stats.get("db_size", 0) / 1024, 1)
+    body = f"""
+    <div class="hero"><h1>🗄️ قاعدة البيانات</h1><p>تخزين المنتجات والطلبات والذاكرة والكاش داخل SQLite.</p></div>
+    {admin_nav(key)}
+    {f'<p class="msg">{e(msg)}</p>' if msg else ''}
+    <div class="stats">
+      <div class="stat"><b>{stats['products']}</b><span>منتجات في SQL</span></div>
+      <div class="stat"><b>{stats['orders']}</b><span>طلبات في SQL</span></div>
+      <div class="stat"><b>{stats['memory_entries']}</b><span>عناصر ذاكرة</span></div>
+      <div class="stat"><b>{size_kb} KB</b><span>حجم قاعدة البيانات</span></div>
+    </div>
+    <div class="box">
+      <h2>المسار</h2>
+      <pre>{e(stats['db_file'])}</pre>
+      <div class="admin-hint">
+        قاعدة البيانات تعمل الآن محلياً على السيرفر. ملفات CSV و JSON تبقى كمرايا/نسخ احتياطية للتصدير وسهولة المراجعة، لكن التشغيل الأساسي صار من SQLite.
+      </div>
+      <div class="actions">
+        <a class="btn secondary" href="/admin/orders/export?key={key_q}">تصدير الطلبات CSV</a>
+        <a class="btn secondary" href="/admin/template.csv?key={key_q}">تحميل قالب المنتجات</a>
+      </div>
+    </div>
+    """
+    return HTMLResponse(page_layout("قاعدة بيانات PriceBot", body))
+
+@app.get("/admin/memory")
+def admin_memory(key: str = "", msg: str = ""):
+    if not check_admin(key):
+        return HTMLResponse("Unauthorized", status_code=401)
+    stats = memory_stats()
+    mem = load_memory()
+    key_q = urllib.parse.quote(key)
+    today_usage = "<br>".join([f"{e(k)}: {e(v)}" for k, v in stats.get("ai_usage_today", {}).items()]) or "لا يوجد استخدام AI اليوم"
+    corrections_rows = ""
+    for phrase, product in list(mem.get("admin_corrections", {}).items())[-80:]:
+        corrections_rows += f"<tr><td>{e(phrase)}</td><td>{e(product)}</td><td><a class='btn danger' href='/admin/memory/delete?key={key_q}&phrase={urllib.parse.quote(phrase)}'>حذف</a></td></tr>"
+    query_rows = ""
+    for phrase, entry in list(mem.get("query_cache", {}).items())[-80:]:
+        if not isinstance(entry, dict):
+            continue
+        target = entry.get("product_name") or ", ".join(entry.get("product_names", []))
+        query_rows += f"<tr><td>{e(phrase)}</td><td>{e(entry.get('type',''))}</td><td>{e(target)}</td><td>{e(entry.get('source',''))}</td><td>{e(entry.get('hits',0))}</td></tr>"
+    body = f"""
+    <div class="hero"><h1>🧠 ذاكرة البوت</h1><p>تقلل استخدام AI وتحفظ التصحيحات المتكررة.</p></div>
+    {admin_nav(key)}
+    {f'<p class="msg">{e(msg)}</p>' if msg else ''}
+    <div class="stats">
+      <div class="stat"><b>{stats['query_cache']}</b><span>أسئلة محفوظة</span></div>
+      <div class="stat"><b>{stats['image_cache']}</b><span>صور محفوظة</span></div>
+      <div class="stat"><b>{stats['admin_corrections']}</b><span>تصحيحات أدمن</span></div>
+      <div class="stat"><b>{stats['product_alias_memory']}</b><span>ذاكرة أسماء</span></div>
+    </div>
+    <div class="box">
+      <h2>استخدام AI اليوم</h2>
+      <div class="admin-hint">{today_usage}</div>
+    </div>
+    <div class="box">
+      <h2>إضافة تصحيح يدوي</h2>
+      <form method="post" action="/admin/memory/save?key={key_q}" class="form-grid">
+        <div class="field"><label>عبارة الزبون</label><input name="phrase" placeholder="مثال: بندل"></div>
+        <div class="field"><label>اسم المنتج الصحيح</label><input name="product" placeholder="مثال: بنادول"></div>
+        <div class="field" style="grid-column:1/-1"><button type="submit">حفظ التصحيح</button></div>
+      </form>
+    </div>
+    <div class="box">
+      <h2>تصحيحات الأدمن</h2>
+      <div class="table-wrap"><table><tr><th>العبارة</th><th>المنتج الصحيح</th><th>إجراء</th></tr>{corrections_rows or '<tr><td colspan="3">لا توجد تصحيحات</td></tr>'}</table></div>
+    </div>
+    <div class="box">
+      <h2>آخر أسئلة محفوظة</h2>
+      <div class="table-wrap"><table><tr><th>العبارة</th><th>النوع</th><th>النتيجة</th><th>المصدر</th><th>Hits</th></tr>{query_rows or '<tr><td colspan="5">لا توجد ذاكرة أسئلة</td></tr>'}</table></div>
+    </div>
+    <div class="box">
+      <a class="btn danger" href="/admin/memory/clear?key={key_q}" onclick="return confirm('مسح ذاكرة الأسئلة والصور؟ التصحيحات اليدوية لا تُحذف.');">مسح الكاش فقط</a>
+    </div>
+    """
+    return HTMLResponse(page_layout("ذاكرة البوت", body))
+
+
+@app.post("/admin/memory/save")
+async def admin_memory_save(request: Request, key: str = ""):
+    if not check_admin(key):
+        return HTMLResponse("Unauthorized", status_code=401)
+    form = await request.form()
+    phrase = memory_query_key(str(form.get("phrase", "")))
+    product = str(form.get("product", "")).strip()
+    if not phrase or not product:
+        return safe_redirect(f"/admin/memory?key={urllib.parse.quote(key)}&msg={urllib.parse.quote('أدخل العبارة والمنتج')}")
+    mem = load_memory()
+    mem.setdefault("admin_corrections", {})[phrase] = product
+    save_memory(mem)
+    return safe_redirect(f"/admin/memory?key={urllib.parse.quote(key)}&msg={urllib.parse.quote('تم حفظ التصحيح')}")
+
+
+@app.get("/admin/memory/delete")
+def admin_memory_delete(key: str = "", phrase: str = ""):
+    if not check_admin(key):
+        return HTMLResponse("Unauthorized", status_code=401)
+    mem = load_memory()
+    mem.get("admin_corrections", {}).pop(phrase, None)
+    save_memory(mem)
+    return safe_redirect(f"/admin/memory?key={urllib.parse.quote(key)}&msg={urllib.parse.quote('تم حذف التصحيح')}")
+
+
+@app.get("/admin/memory/clear")
+def admin_memory_clear(key: str = ""):
+    if not check_admin(key):
+        return HTMLResponse("Unauthorized", status_code=401)
+    mem = load_memory()
+    mem["query_cache"] = {}
+    mem["product_alias_memory"] = {}
+    mem["image_cache"] = {}
+    save_memory(mem)
+    return safe_redirect(f"/admin/memory?key={urllib.parse.quote(key)}&msg={urllib.parse.quote('تم مسح كاش الذاكرة')}")
+
+
+
+@app.get("/admin/orders")
+def admin_orders(key: str = "", msg: str = "", status: str = "all", q: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    orders = read_orders()
+    qn = normalize(q)
+
+    def status_ar(s: str) -> str:
+        return {
+            "pending": "بانتظار التأكيد",
+            "new": "جديد",
+            "review": "يحتاج مراجعة",
+            "confirmed": "مؤكد",
+            "rejected": "مرفوض",
+            "done": "منفذ",
+        }.get(s or "pending", s or "بانتظار")
+
+    def badge_class(s: str) -> str:
+        if s in {"confirmed", "done"}:
+            return "done"
+        if s == "rejected":
+            return "danger"
+        return "new"
+
+    filtered = []
+    for row in orders:
+        row_status = row.get("status") or "pending"
+        if status != "all" and row_status != status:
+            continue
+        if qn:
+            hay = normalize(" ".join([row.get("phone",""), row.get("product",""), row.get("notes",""), row.get("message","")]))
+            if qn not in hay:
+                continue
+        filtered.append(row)
+
+    total = len(orders)
+    pending_count = sum(1 for r in orders if (r.get("status") or "pending") in {"pending", "new", "review"})
+    confirmed_count = sum(1 for r in orders if r.get("status") == "confirmed")
+    rejected_count = sum(1 for r in orders if r.get("status") == "rejected")
+    done_count = sum(1 for r in orders if r.get("status") == "done")
+
+    cards = ""
+    # Display newest first; idx still points to original list index.
+    for idx, row in sorted(list(enumerate(orders)), key=lambda x: x[1].get("time", ""), reverse=True):
+        if row not in filtered:
+            continue
+        row_status = row.get("status") or "pending"
+        phone = row.get("phone", "")
+        phone_link = f"https://wa.me/{urllib.parse.quote(phone)}" if phone else "#"
+        msg_text = row.get("message", "")
+        image_link = ""
+        m = re.search(r"https?://\S+", msg_text or "")
+        if m:
+            image_link = f'<a class="btn secondary" target="_blank" href="{e(m.group(0))}">فتح الصورة</a>'
+
+        confirm_btn = ""
+        reject_btn = ""
+        done_btn = ""
+        if row_status in {"pending", "new", "review"}:
+            confirm_btn = f'<a class="btn ok" href="/admin/orders/confirm?key={urllib.parse.quote(key)}&idx={idx}" onclick="return confirm(\'تأكيد الطلب وإرسال رسالة للزبون؟\')">تأكيد للزبون</a>'
+            reject_btn = f'<a class="btn danger" href="/admin/orders/reject?key={urllib.parse.quote(key)}&idx={idx}" onclick="return confirm(\'رفض الطلب وإرسال اعتذار للزبون؟\')">رفض</a>'
+        if row_status in {"confirmed", "pending", "new", "review"}:
+            done_btn = f'<a class="btn secondary" href="/admin/orders/done?key={urllib.parse.quote(key)}&idx={idx}">تم التنفيذ</a>'
+
+        cards += f"""
+        <div class="card order-card">
+          <div class="order-head"><div class="order-title">{e(row.get('product'))}</div><span class="badge {badge_class(row_status)}">{status_ar(row_status)}</span></div>
+          <div class="order-row"><strong>الوقت</strong><span>{e(row.get('time'))}</span></div>
+          <div class="order-row"><strong>رقم الزبون</strong><a href="{phone_link}" target="_blank">{e(phone)}</a></div>
+          <div class="order-row"><strong>السعر</strong><span>{e(row.get('price') or '-')}</span></div>
+          <div class="order-row"><strong>التوفر</strong><span>{e(row.get('available') or '-')}</span></div>
+          <div class="order-row"><strong>ملاحظة</strong><span>{e(row.get('notes') or '-')}</span></div>
+          <div class="order-row"><strong>رسالة</strong><span>{e((msg_text or '-')[:180])}</span></div>
+          <div class="actions">{confirm_btn}{reject_btn}{done_btn}<a class="btn secondary" target="_blank" href="{phone_link}">مراسلة الزبون</a>{image_link}<a class="btn danger" href="/admin/orders/delete?key={urllib.parse.quote(key)}&idx={idx}" onclick="return confirm('حذف الطلب؟')">حذف</a></div>
+        </div>
+        """
+    if not cards:
+        cards = '<div class="box notice">لا توجد طلبات في هذا القسم.</div>'
+
+    key_q = urllib.parse.quote(key)
+    body = f"""
+    <div class="hero"><h1>طلبات الحجز</h1><p>{e(business_name())} — الطلب لا يعتبر مؤكداً حتى تضغط زر التأكيد.</p></div>
+    {admin_nav(key)}
+    <div class="stats">
+      <div class="stat"><b>{total}</b><span>كل الطلبات</span></div>
+      <div class="stat"><b>{pending_count}</b><span>بانتظار التأكيد</span></div>
+      <div class="stat"><b>{confirmed_count}</b><span>مؤكدة</span></div>
+      <div class="stat"><b>{rejected_count}</b><span>مرفوضة</span></div>
+    </div>
+    <div class="box">
+      <p class="msg">{e(msg)}</p>
+      <form method="get" action="/admin/orders">
+        <input type="hidden" name="key" value="{e(key)}">
+        <div class="form-grid">
+          <div class="field"><label>بحث في الطلبات</label><input name="q" value="{e(q)}" placeholder="رقم زبون / منتج / ملاحظة"></div>
+          <div class="field"><label>الحالة</label><select name="status">
+            <option value="all" {'selected' if status=='all' else ''}>كل الطلبات</option>
+            <option value="pending" {'selected' if status=='pending' else ''}>بانتظار التأكيد</option>
+            <option value="review" {'selected' if status=='review' else ''}>يحتاج مراجعة</option>
+            <option value="confirmed" {'selected' if status=='confirmed' else ''}>مؤكدة</option>
+            <option value="rejected" {'selected' if status=='rejected' else ''}>مرفوضة</option>
+            <option value="done" {'selected' if status=='done' else ''}>منفذة</option>
+          </select></div>
+        </div>
+        <div class="actions"><button type="submit">تطبيق</button><a class="btn secondary" href="/admin/orders?key={key_q}&status=pending">بانتظار التأكيد</a><a class="btn secondary" href="/admin/orders?key={key_q}&status=review">مراجعة الصور</a><a class="btn ok" href="/admin/daily-report/send?key={key_q}">إرسال تقرير اليوم للأدمن</a><a class="btn secondary" href="/admin/orders/export?key={key_q}">تصدير CSV</a></div>
+      </form>
+    </div>
+    <div class="product-grid">{cards}</div>
+    """
+    return HTMLResponse(page_layout("طلبات PriceBot", body))
+
+
+@app.get("/admin/orders/confirm")
+def admin_orders_confirm(key: str = "", idx: int = -1):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    orders = read_orders()
+    if 0 <= idx < len(orders):
+        orders[idx]["status"] = "confirmed"
+        write_orders(orders)
+        send_whatsapp_message(orders[idx].get("phone", ""), customer_order_confirmed_message(orders[idx]))
+        msg = "تم تأكيد الطلب وإرسال رسالة للزبون"
+    else:
+        msg = "لم يتم العثور على الطلب"
+    return safe_redirect(f"/admin/orders?key={urllib.parse.quote(key)}&msg={urllib.parse.quote(msg)}")
+
+
+@app.get("/admin/orders/reject")
+def admin_orders_reject(key: str = "", idx: int = -1):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    orders = read_orders()
+    if 0 <= idx < len(orders):
+        orders[idx]["status"] = "rejected"
+        write_orders(orders)
+        send_whatsapp_message(orders[idx].get("phone", ""), customer_order_rejected_message(orders[idx]))
+        msg = "تم رفض الطلب وإرسال رسالة للزبون"
+    else:
+        msg = "لم يتم العثور على الطلب"
+    return safe_redirect(f"/admin/orders?key={urllib.parse.quote(key)}&msg={urllib.parse.quote(msg)}")
+
+
+@app.get("/admin/orders/done")
+def admin_orders_done(key: str = "", idx: int = -1):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    orders = read_orders()
+    if 0 <= idx < len(orders):
+        orders[idx]["status"] = "done"
+        write_orders(orders)
+        msg = "تم تحديث الطلب كمنفذ"
+    else:
+        msg = "لم يتم العثور على الطلب"
+    return safe_redirect(f"/admin/orders?key={urllib.parse.quote(key)}&msg={urllib.parse.quote(msg)}")
+
+
+@app.get("/admin/orders/delete")
+def admin_orders_delete(key: str = "", idx: int = -1):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    orders = read_orders()
+    if 0 <= idx < len(orders):
+        orders.pop(idx)
+        write_orders(orders)
+        msg = "تم حذف الطلب"
+    else:
+        msg = "لم يتم العثور على الطلب"
+    return safe_redirect(f"/admin/orders?key={urllib.parse.quote(key)}&msg={urllib.parse.quote(msg)}")
+
+
+@app.get("/admin/orders/export")
+def admin_orders_export(key: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=ORDER_FIELDS)
+    writer.writeheader()
+    for row in read_orders():
+        writer.writerow({field: row.get(field, "") for field in ORDER_FIELDS})
+    return PlainTextResponse(
+        "\ufeff" + output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=pricebot_orders.csv"},
+    )
+
+
+@app.get("/admin/daily-report/send")
+def admin_daily_report_send(key: str = "", auto: str = "0"):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    ok = notify_admin(build_daily_report_message(), "")
+    if auto == "1":
+        return {"ok": bool(ok)}
+    msg = "تم إرسال التقرير اليومي للأدمن" if ok else "لم يتم الإرسال: تأكد من رقم الأدمن"
+    return safe_redirect(f"/admin/orders?key={urllib.parse.quote(key)}&msg={urllib.parse.quote(msg)}")
+
+
+@app.get("/admin/media/{filename}")
+def admin_media(filename: str, key: str = ""):
+    if not check_admin(key):
+        return PlainTextResponse("Forbidden", status_code=403)
+    safe_name = Path(filename).name
+    path = MEDIA_DIR / safe_name
+    if not path.exists() or not path.is_file():
+        return PlainTextResponse("Not found", status_code=404)
+    return FileResponse(path)
+
+@app.get("/privacy")
+def privacy_policy():
+    return PlainTextResponse(
+        """
+PriceBot Privacy Policy
+
+PriceBot receives WhatsApp messages only to respond to customer product and price inquiries.
+We do not sell user data.
+We do not share customer messages with advertisers.
+Messages may be processed to provide automated replies about product availability and prices.
+Users can request deletion of their data by contacting the business owner.
+
+Data deletion URL:
+/delete-data
+""".strip()
+    )
+
+
+@app.get("/delete-data")
+def delete_data():
+    return PlainTextResponse(
+        """
+Data Deletion Instructions
+
+To request deletion of your WhatsApp messages or customer data, contact the business owner and provide your WhatsApp number.
+The business owner will delete your related records from the system when applicable.
+""".strip()
+    )
+
+
+@app.get("/webhook/whatsapp")
+async def verify_webhook(request: Request):
+    params = request.query_params
+    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == VERIFY_TOKEN:
+        return PlainTextResponse(params.get("hub.challenge", ""))
+    return PlainTextResponse("Forbidden", status_code=403)
+
+
+
+@app.post("/webhook/whatsapp")
+async def whatsapp_webhook(request: Request):
+    data = await request.json()
+    try:
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                if "statuses" in value and "messages" not in value:
+                    return JSONResponse({"status": "status_event_ignored"})
+                for msg in value.get("messages", []):
+                    from_number = msg.get("from")
+                    if not from_number:
+                        continue
+                    msg_type = msg.get("type")
+                    if msg_type == "text":
+                        text_msg = msg.get("text", {}).get("body", "")
+                        reply = build_reply(text_msg, from_number)
+                    elif msg_type == "image":
+                        reply = process_image_message(msg, from_number)
+                    elif msg_type in {"document", "audio", "video"}:
+                        save_review_order(from_number, f"ملف {msg_type} يحتاج مراجعة", f"وصل ملف من نوع {msg_type}", "")
+                        notify_admin(
+                            f"📎 ملف يحتاج مراجعة - {pharmacy_name()}\n\nرقم الزبون: {from_number}\nنوع الملف: {msg_type}\nالوقت: {now_str()}",
+                            from_number,
+                        )
+                        reply = build_image_under_review_reply()
+                    else:
+                        reply = (
+                            f"{pharmacy_name()} 🌿\n\n"
+                            "أستطيع الرد على أسماء المنتجات المكتوبة أو صور المنتجات.\n"
+                            "للروشتات أو الصور غير الواضحة سيتم تحويلها للصيدلي."
+                        )
+                    send_whatsapp_message(from_number, reply)
+    except Exception as exc:
+        print("WEBHOOK PROCESS ERROR:", str(exc), flush=True)
+    return JSONResponse({"status": "received"})
+
+@app.get("/test")
+def test_reply(q: str = ""):
+    return {"reply": build_reply(q)}
+
+
+
+# ============================================================
+# FAST_WEBHOOK_BACKGROUND_THREAD_V1
+# يمنع تجميد FastAPI event loop:
+# POST /webhook/whatsapp يرجع فوراً، والمعالجة الثقيلة تعمل في thread منفصل.
+# لا يغيّر منطق البوت ولا الردود.
+# ============================================================
+
+try:
+    import asyncio as _fw_asyncio
+    import inspect as _fw_inspect
+    import json as _fw_json
+    import logging as _fw_logging
+    import threading as _fw_threading
+    from starlette.responses import JSONResponse as _FW_JSONResponse
+
+    _fw_log = _fw_logging.getLogger("pricebot.fast_webhook")
+    _fw_old_whatsapp_post_endpoint = None
+
+    for _fw_route in getattr(app, "routes", []):
+        if getattr(_fw_route, "path", "") == "/webhook/whatsapp" and "POST" in getattr(_fw_route, "methods", set()):
+            _fw_old_whatsapp_post_endpoint = getattr(_fw_route, "endpoint", None)
+            break
+
+    class _FWFakeRequest:
+        def __init__(self, body: bytes, headers: dict):
+            self._body = body or b"{}"
+            self.headers = headers or {}
+            self.method = "POST"
+            self.app = app
+            self.query_params = {}
+            self.path_params = {}
+            self.client = None
+            self.url = "/webhook/whatsapp"
+
+        async def body(self):
+            return self._body
+
+        async def json(self):
+            try:
+                if not self._body:
+                    return {}
+                return _fw_json.loads(self._body.decode("utf-8", errors="ignore"))
+            except Exception:
+                return {}
+
+    async def _fw_call_old_endpoint(fake_request):
+        if _fw_old_whatsapp_post_endpoint is None:
+            _fw_log.error("No original WhatsApp POST endpoint found")
+            return
+
+        try:
+            sig = _fw_inspect.signature(_fw_old_whatsapp_post_endpoint)
+            params = list(sig.parameters)
+
+            if len(params) <= 0:
+                result = _fw_old_whatsapp_post_endpoint()
+            elif len(params) == 1:
+                result = _fw_old_whatsapp_post_endpoint(fake_request)
+            else:
+                # دعم احتياطي لو كان endpoint يقبل request + background_tasks
+                result = _fw_old_whatsapp_post_endpoint(fake_request, None)
+
+            if _fw_inspect.isawaitable(result):
+                await result
+
+        except Exception:
+            _fw_log.exception("Background WhatsApp processing failed")
+
+    def _fw_process_in_thread(body: bytes, headers: dict):
+        try:
+            fake_request = _FWFakeRequest(body, headers)
+            _fw_asyncio.run(_fw_call_old_endpoint(fake_request))
+        except Exception:
+            _fw_log.exception("WhatsApp background thread failed")
+
+    @app.middleware("http")
+    async def _fw_fast_whatsapp_webhook_middleware(request, call_next):
+        if request.method == "POST" and request.url.path == "/webhook/whatsapp":
+            body = await request.body()
+            headers = dict(request.headers)
+
+            _fw_threading.Thread(
+                target=_fw_process_in_thread,
+                args=(body, headers),
+                daemon=True,
+                name="pricebot-whatsapp-background",
+            ).start()
+
+            return _FW_JSONResponse({"ok": True, "queued": True})
+
+        return await call_next(request)
+
+    print("FAST_WEBHOOK_BACKGROUND_THREAD_V1 loaded")
+
+except Exception as _fw_e:
+    print("FAST_WEBHOOK_BACKGROUND_THREAD_V1 error:", _fw_e)
+
+
+
+# ============================================================
+# PERSIST_CONVERSATION_STATE_SQLITE_V3
+# يحفظ LAST_PRODUCT و PENDING_SUGGESTION في SQLite بدل RAM
+# حتى لا تضيع حالة الزبون بعد restart
+# ============================================================
+
+try:
+    import sqlite3 as _pstate_sqlite3
+    import json as _pstate_json
+    import time as _pstate_time
+    from pathlib import Path as _pstate_Path
+    from collections.abc import MutableMapping as _pstate_MutableMapping
+
+    def _pstate_db_path():
+        if _pstate_Path("/opt/pricebot").exists():
+            return "/opt/pricebot/pricebot.db"
+        return "pricebot.db"
+
+    def _pstate_conn():
+        con = _pstate_sqlite3.connect(_pstate_db_path(), timeout=30)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_state (
+                namespace TEXT NOT NULL,
+                user_key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (namespace, user_key)
+            )
+        """)
+        con.commit()
+        return con
+
+    def _pstate_encode(value):
+        return _pstate_json.dumps(value, ensure_ascii=False, default=str)
+
+    def _pstate_decode(value_json):
+        try:
+            return _pstate_json.loads(value_json)
+        except Exception:
+            return value_json
+
+    def _pstate_cleanup(max_age_seconds=86400):
+        try:
+            cutoff = int(_pstate_time.time()) - int(max_age_seconds)
+            con = _pstate_conn()
+            con.execute("DELETE FROM conversation_state WHERE updated_at < ?", (cutoff,))
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+
+    class _PersistentStateDict(_pstate_MutableMapping):
+        def __init__(self, namespace):
+            self.namespace = str(namespace)
+
+        def _k(self, key):
+            return str(key)
+
+        def __getitem__(self, key):
+            k = self._k(key)
+            con = _pstate_conn()
+            row = con.execute(
+                "SELECT value_json FROM conversation_state WHERE namespace=? AND user_key=?",
+                (self.namespace, k),
+            ).fetchone()
+            con.close()
+            if not row:
+                raise KeyError(key)
+            return _pstate_decode(row[0])
+
+        def __setitem__(self, key, value):
+            k = self._k(key)
+            now = int(_pstate_time.time())
+            con = _pstate_conn()
+            con.execute("""
+                INSERT INTO conversation_state(namespace, user_key, value_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(namespace, user_key)
+                DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
+            """, (self.namespace, k, _pstate_encode(value), now))
+            con.commit()
+            con.close()
+
+        def __delitem__(self, key):
+            k = self._k(key)
+            con = _pstate_conn()
+            cur = con.execute(
+                "DELETE FROM conversation_state WHERE namespace=? AND user_key=?",
+                (self.namespace, k),
+            )
+            con.commit()
+            con.close()
+            if cur.rowcount == 0:
+                raise KeyError(key)
+
+        def __iter__(self):
+            con = _pstate_conn()
+            rows = con.execute(
+                "SELECT user_key FROM conversation_state WHERE namespace=?",
+                (self.namespace,),
+            ).fetchall()
+            con.close()
+            return iter([r[0] for r in rows])
+
+        def __len__(self):
+            con = _pstate_conn()
+            row = con.execute(
+                "SELECT COUNT(*) FROM conversation_state WHERE namespace=?",
+                (self.namespace,),
+            ).fetchone()
+            con.close()
+            return int(row[0] if row else 0)
+
+        def get(self, key, default=None):
+            try:
+                return self[key]
+            except KeyError:
+                return default
+
+        def pop(self, key, default=None):
+            try:
+                value = self[key]
+                try:
+                    del self[key]
+                except KeyError:
+                    pass
+                return value
+            except KeyError:
+                return default
+
+        def setdefault(self, key, default=None):
+            try:
+                return self[key]
+            except KeyError:
+                self[key] = default
+                return default
+
+        def clear(self):
+            con = _pstate_conn()
+            con.execute("DELETE FROM conversation_state WHERE namespace=?", (self.namespace,))
+            con.commit()
+            con.close()
+
+    _pstate_cleanup(86400)
+
+    _old_last_product = globals().get("LAST_PRODUCT", {})
+    _old_pending_suggestion = globals().get("PENDING_SUGGESTION", {})
+
+    LAST_PRODUCT = _PersistentStateDict("LAST_PRODUCT")
+    PENDING_SUGGESTION = _PersistentStateDict("PENDING_SUGGESTION")
+
+    if isinstance(_old_last_product, dict):
+        for _k, _v in _old_last_product.items():
+            try:
+                LAST_PRODUCT[_k] = _v
+            except Exception:
+                pass
+
+    if isinstance(_old_pending_suggestion, dict):
+        for _k, _v in _old_pending_suggestion.items():
+            try:
+                PENDING_SUGGESTION[_k] = _v
+            except Exception:
+                pass
+
+    print("PERSIST_CONVERSATION_STATE_SQLITE_V3 loaded")
+
+except Exception as _pstate_e:
+    print("PERSIST_CONVERSATION_STATE_SQLITE_V3 error:", _pstate_e)
+
+
+
+# ============================================================
+# PRICEBOT_NUMBER_SELECTION_FIX_V1
+# يحفظ آخر قائمة خيارات مرسلة للزبون، ويجعل الرد برقم مثل 1 أو 2 اختيارًا من القائمة
+# بدل اعتباره بحثًا جديدًا.
+# ============================================================
+
+try:
+    import re as _sel_re
+    import os as _sel_os
+    import json as _sel_json
+    import time as _sel_time
+    import threading as _sel_threading
+    import requests as _sel_requests
+    import inspect as _sel_inspect
+    from starlette.responses import JSONResponse as _SEL_JSONResponse
+
+    _sel_ar_digits = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+    def _sel_norm_number_text(txt):
+        return str(txt or "").strip().translate(_sel_ar_digits)
+
+    def _sel_parse_number(txt):
+        t = _sel_norm_number_text(txt)
+        if _sel_re.fullmatch(r"\d{1,2}", t):
+            try:
+                return int(t)
+            except Exception:
+                return None
+        return None
+
+    def _sel_parse_options_from_text(text):
+        text = str(text or "")
+        if "اختر" not in text and "اكتب الرقم" not in text:
+            return []
+
+        lines = [x.strip() for x in text.splitlines() if x.strip()]
+        options = []
+
+        for line in lines:
+            m = _sel_re.match(r"^([0-9٠-٩]{1,2})[\.\-\)]\s*(.+)$", line)
+            if not m:
+                continue
+
+            num = int(m.group(1).translate(_sel_ar_digits))
+            raw = m.group(2).strip()
+
+            # استخراج السعر
+            price = ""
+            pm = _sel_re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*د\.?\s*ل?", raw)
+            if pm:
+                price = pm.group(1).replace(",", ".")
+
+            available = "متوفر" if "متوفر" in raw and "غير متوفر" not in raw else ("غير متوفر" if "غير متوفر" in raw else "")
+
+            # الاسم قبل أول فاصل واضح
+            name_part = raw
+            for sep in [" - ", " — ", " – "]:
+                if sep in name_part:
+                    name_part = name_part.split(sep, 1)[0].strip()
+                    break
+
+            # تنظيف بسيط
+            name_part = _sel_re.sub(r"\s+", " ", name_part).strip()
+
+            options.append({
+                "number": num,
+                "name": name_part,
+                "product_name": name_part,
+                "price": price,
+                "available": available,
+                "notes": raw,
+                "raw": raw,
+                "display": raw,
+            })
+
+        options = sorted(options, key=lambda x: x.get("number", 0))
+        return options
+
+    def _sel_find_phone_and_text(args, kwargs):
+        strings = []
+        for a in args:
+            if isinstance(a, str):
+                strings.append(a)
+        for v in kwargs.values():
+            if isinstance(v, str):
+                strings.append(v)
+
+        text_candidate = ""
+        phone_candidate = ""
+
+        for s in strings:
+            if len(s) > len(text_candidate) and ("\n" in s or "صيدلية" in s or "اختر" in s or "المنتج" in s):
+                text_candidate = s
+
+        for s in strings:
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if 7 <= len(digits) <= 20 and s != text_candidate:
+                phone_candidate = digits
+                break
+
+        return phone_candidate, text_candidate
+
+    def _sel_store_options_for_phone(phone, text):
+        if not phone:
+            return
+
+        options = _sel_parse_options_from_text(text)
+        if not options:
+            return
+
+        try:
+            PENDING_SUGGESTION[phone] = {
+                "type": "selection_options",
+                "created_at": int(_sel_time.time()),
+                "options": options,
+            }
+            print(f"PRICEBOT_NUMBER_SELECTION_FIX_V1 stored {len(options)} options for {phone}")
+        except Exception as e:
+            print("PRICEBOT_NUMBER_SELECTION_FIX_V1 store error:", e)
+
+    def _sel_wrap_send_function(fn):
+        if getattr(fn, "_pricebot_selection_wrapped", False):
+            return fn
+
+        if _sel_inspect.iscoroutinefunction(fn):
+            async def async_wrapper(*args, **kwargs):
+                phone, text = _sel_find_phone_and_text(args, kwargs)
+                _sel_store_options_for_phone(phone, text)
+                return await fn(*args, **kwargs)
+            async_wrapper._pricebot_selection_wrapped = True
+            return async_wrapper
+
+        def sync_wrapper(*args, **kwargs):
+            phone, text = _sel_find_phone_and_text(args, kwargs)
+            _sel_store_options_for_phone(phone, text)
+            return fn(*args, **kwargs)
+
+        sync_wrapper._pricebot_selection_wrapped = True
+        return sync_wrapper
+
+    # لف دوال الإرسال المحتملة حتى نحفظ القائمة عند إرسالها للزبون
+    for _name, _fn in list(globals().items()):
+        if not callable(_fn):
+            continue
+        lname = _name.lower()
+        if (
+            ("send" in lname or "reply" in lname)
+            and ("whatsapp" in lname or "message" in lname or "text" in lname)
+            and not lname.startswith("_sel_")
+            and _name not in ["JSONResponse"]
+        ):
+            try:
+                globals()[_name] = _sel_wrap_send_function(_fn)
+            except Exception:
+                pass
+
+    def _sel_env(*names):
+        for n in names:
+            v = _sel_os.getenv(n)
+            if v:
+                return v.strip()
+        return ""
+
+    def _sel_send_text_direct(to_phone, body):
+        token = _sel_env(
+            "WHATSAPP_TOKEN",
+            "WHATSAPP_ACCESS_TOKEN",
+            "META_ACCESS_TOKEN",
+            "ACCESS_TOKEN",
+            "WHATSAPP_CLOUD_TOKEN",
+        )
+        phone_id = _sel_env(
+            "WHATSAPP_PHONE_NUMBER_ID",
+            "PHONE_NUMBER_ID",
+            "META_PHONE_NUMBER_ID",
+            "WA_PHONE_NUMBER_ID",
+        )
+
+        if not token or not phone_id:
+            print("PRICEBOT_NUMBER_SELECTION_FIX_V1 cannot direct-send: missing token or phone_id")
+            return False
+
+        url = f"https://graph.facebook.com/v19.0/{phone_id}/messages"
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": str(to_phone),
+            "type": "text",
+            "text": {"body": str(body)},
+        }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            r = _sel_requests.post(url, headers=headers, json=payload, timeout=20)
+            print("PRICEBOT_NUMBER_SELECTION_FIX_V1 direct send:", r.status_code, r.text[:200])
+            return 200 <= r.status_code < 300
+        except Exception as e:
+            print("PRICEBOT_NUMBER_SELECTION_FIX_V1 direct send error:", e)
+            return False
+
+    def _sel_extract_messages(payload):
+        out = []
+        try:
+            for entry in payload.get("entry", []) or []:
+                for change in entry.get("changes", []) or []:
+                    value = change.get("value", {}) or {}
+                    for msg in value.get("messages", []) or []:
+                        frm = str(msg.get("from", "") or "")
+                        body = ""
+                        if msg.get("type") == "text":
+                            body = ((msg.get("text") or {}).get("body") or "").strip()
+                        if frm and body:
+                            out.append((frm, body))
+        except Exception:
+            pass
+        return out
+
+    def _sel_handle_number_choice(phone, body):
+        n = _sel_parse_number(body)
+        if not n:
+            return False
+
+        state = None
+        try:
+            state = PENDING_SUGGESTION.get(phone)
+        except Exception:
+            state = None
+
+        if not isinstance(state, dict) or state.get("type") != "selection_options":
+            return False
+
+        options = state.get("options") or []
+        if not isinstance(options, list) or n < 1 or n > len(options):
+            _sel_threading.Thread(
+                target=_sel_send_text_direct,
+                args=(phone, "الرقم غير موجود في القائمة. اكتب رقمًا من الخيارات المعروضة."),
+                daemon=True,
+            ).start()
+            return True
+
+        product = dict(options[n - 1])
+
+        try:
+            LAST_PRODUCT[phone] = product
+            PENDING_SUGGESTION.pop(phone, None)
+        except Exception as e:
+            print("PRICEBOT_NUMBER_SELECTION_FIX_V1 state set error:", e)
+
+        name = product.get("name") or product.get("product_name") or product.get("raw") or "المنتج"
+        price = product.get("price") or ""
+        available = product.get("available") or ""
+        raw = product.get("raw") or name
+
+        msg = "صيدلية بدر البشرية 🌿\n\n"
+        msg += f"تم اختيار:\n{raw}\n\n"
+        if available:
+            msg += f"الحالة: {available}\n"
+        if price:
+            msg += f"السعر: {price} د.ل\n"
+        msg += "\nللحجز اكتب: نعم"
+
+        _sel_threading.Thread(
+            target=_sel_send_text_direct,
+            args=(phone, msg),
+            daemon=True,
+        ).start()
+
+        return True
+
+    @app.middleware("http")
+    async def _pricebot_number_selection_middleware(request, call_next):
+        if request.method == "POST" and request.url.path == "/webhook/whatsapp":
+            try:
+                body_bytes = await request.body()
+                payload = _sel_json.loads(body_bytes.decode("utf-8", errors="ignore") or "{}")
+
+                for phone, msg_body in _sel_extract_messages(payload):
+                    if _sel_handle_number_choice(phone, msg_body):
+                        return _SEL_JSONResponse({"ok": True, "number_selection": True})
+
+            except Exception as e:
+                print("PRICEBOT_NUMBER_SELECTION_FIX_V1 middleware error:", e)
+
+        return await call_next(request)
+
+    print("PRICEBOT_NUMBER_SELECTION_FIX_V1 loaded")
+
+except Exception as _sel_e:
+    print("PRICEBOT_NUMBER_SELECTION_FIX_V1 error:", _sel_e)
+
+
+
+# ============================================================
+# PRICEBOT_WEBHOOK_QUEUE_WORKERS_V1
+# يجعل Webhook سريعًا ويضع الرسائل في Queue بدل فتح Thread لكل رسالة.
+# يحمي السيرفر عند دخول 50+ مستخدم بنفس الوقت.
+# ============================================================
+
+try:
+    import os as _q_os
+    import json as _q_json
+    import queue as _q_queue
+    import time as _q_time
+    import threading as _q_threading
+    import asyncio as _q_asyncio
+    import inspect as _q_inspect
+    import logging as _q_logging
+    from starlette.responses import JSONResponse as _Q_JSONResponse
+
+    _q_log = _q_logging.getLogger("pricebot.webhook_queue")
+
+    _WEBHOOK_QUEUE_MAX = int(_q_os.getenv("PRICEBOT_WEBHOOK_QUEUE_MAX", "1000"))
+    _WEBHOOK_WORKERS = int(_q_os.getenv("PRICEBOT_WEBHOOK_WORKERS", "4"))
+
+    _pricebot_webhook_queue = _q_queue.Queue(maxsize=_WEBHOOK_QUEUE_MAX)
+    _pricebot_workers_started = False
+
+    _q_original_whatsapp_post_endpoint = None
+
+    for _q_route in getattr(app, "routes", []):
+        if getattr(_q_route, "path", "") == "/webhook/whatsapp" and "POST" in getattr(_q_route, "methods", set()):
+            _q_original_whatsapp_post_endpoint = getattr(_q_route, "endpoint", None)
+            break
+
+    class _QFakeRequest:
+        def __init__(self, body: bytes, headers: dict):
+            self._body = body or b"{}"
+            self.headers = headers or {}
+            self.method = "POST"
+            self.app = app
+            self.query_params = {}
+            self.path_params = {}
+            self.client = None
+            self.url = "/webhook/whatsapp"
+
+        async def body(self):
+            return self._body
+
+        async def json(self):
+            try:
+                return _q_json.loads(self._body.decode("utf-8", errors="ignore") or "{}")
+            except Exception:
+                return {}
+
+    async def _q_call_original_endpoint(fake_request):
+        if _q_original_whatsapp_post_endpoint is None:
+            _q_log.error("No original WhatsApp POST endpoint found")
+            return
+
+        try:
+            sig = _q_inspect.signature(_q_original_whatsapp_post_endpoint)
+            params = list(sig.parameters)
+
+            if len(params) <= 0:
+                result = _q_original_whatsapp_post_endpoint()
+            elif len(params) == 1:
+                result = _q_original_whatsapp_post_endpoint(fake_request)
+            else:
+                result = _q_original_whatsapp_post_endpoint(fake_request, None)
+
+            if _q_inspect.isawaitable(result):
+                await result
+
+        except Exception:
+            _q_log.exception("Webhook worker failed while processing message")
+
+    def _q_worker_loop(worker_id: int):
+        print(f"PRICEBOT_WEBHOOK_QUEUE_WORKERS_V1 worker {worker_id} started")
+
+        while True:
+            item = _pricebot_webhook_queue.get()
+            try:
+                body = item.get("body", b"{}")
+                headers = item.get("headers", {})
+                fake = _QFakeRequest(body, headers)
+                _q_asyncio.run(_q_call_original_endpoint(fake))
+            except Exception:
+                _q_log.exception("Webhook queue worker crashed")
+            finally:
+                try:
+                    _pricebot_webhook_queue.task_done()
+                except Exception:
+                    pass
+
+    def _q_start_workers_once():
+        global _pricebot_workers_started
+
+        if _pricebot_workers_started:
+            return
+
+        _pricebot_workers_started = True
+
+        for i in range(max(1, _WEBHOOK_WORKERS)):
+            t = _q_threading.Thread(
+                target=_q_worker_loop,
+                args=(i + 1,),
+                daemon=True,
+                name=f"pricebot-webhook-worker-{i+1}",
+            )
+            t.start()
+
+        print(f"PRICEBOT_WEBHOOK_QUEUE_WORKERS_V1 loaded workers={_WEBHOOK_WORKERS} max={_WEBHOOK_QUEUE_MAX}")
+
+    _q_start_workers_once()
+
+    @app.middleware("http")
+    async def _pricebot_webhook_queue_middleware(request, call_next):
+        if request.method == "POST" and request.url.path == "/webhook/whatsapp":
+            try:
+                body = await request.body()
+                headers = dict(request.headers)
+
+                _pricebot_webhook_queue.put(
+                    {
+                        "body": body,
+                        "headers": headers,
+                        "received_at": _q_time.time(),
+                    },
+                    block=True,
+                    timeout=0.2,
+                )
+
+                return _Q_JSONResponse({
+                    "ok": True,
+                    "queued": True,
+                    "queue_size": _pricebot_webhook_queue.qsize(),
+                    "workers": _WEBHOOK_WORKERS,
+                })
+
+            except _q_queue.Full:
+                return _Q_JSONResponse({
+                    "ok": False,
+                    "queued": False,
+                    "error": "queue_full",
+                    "queue_size": _pricebot_webhook_queue.qsize(),
+                }, status_code=503)
+
+            except Exception as e:
+                print("PRICEBOT_WEBHOOK_QUEUE_WORKERS_V1 enqueue error:", e)
+                return _Q_JSONResponse({"ok": False, "error": "enqueue_failed"}, status_code=500)
+
+        return await call_next(request)
+
+except Exception as _q_e:
+    print("PRICEBOT_WEBHOOK_QUEUE_WORKERS_V1 error:", _q_e)
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8095"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+# ============================================================
+# PRICEBOT_NUMBER_SELECTION_PRIORITY_BEFORE_QUEUE_V1
+# يجعل اختيار الرقم من القائمة يعمل قبل دخول الرسالة إلى Queue.
+# يحل مشكلة أن الرقم 1 كان يتحول إلى بحث جديد.
+# ============================================================
+
+try:
+    import json as _nsp_json
+    import re as _nsp_re
+    from starlette.responses import JSONResponse as _NSP_JSONResponse
+
+    def _nsp_is_number_message(txt):
+        t = str(txt or "").strip().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+        return bool(_nsp_re.fullmatch(r"\d{1,2}", t))
+
+    @app.middleware("http")
+    async def _pricebot_number_selection_priority_middleware(request, call_next):
+        if request.method == "POST" and request.url.path == "/webhook/whatsapp":
+            try:
+                body = await request.body()
+                payload = _nsp_json.loads(body.decode("utf-8", errors="ignore") or "{}")
+
+                if "_sel_extract_messages" in globals() and "_sel_handle_number_choice" in globals():
+                    for phone, msg_body in _sel_extract_messages(payload):
+                        if _nsp_is_number_message(msg_body):
+                            handled = _sel_handle_number_choice(phone, msg_body)
+                            if handled:
+                                return _NSP_JSONResponse({
+                                    "ok": True,
+                                    "number_selection_priority": True
+                                })
+
+            except Exception as e:
+                print("PRICEBOT_NUMBER_SELECTION_PRIORITY_BEFORE_QUEUE_V1 error:", e)
+
+        return await call_next(request)
+
+    print("PRICEBOT_NUMBER_SELECTION_PRIORITY_BEFORE_QUEUE_V1 loaded")
+
+except Exception as _nsp_e:
+    print("PRICEBOT_NUMBER_SELECTION_PRIORITY_BEFORE_QUEUE_V1 load error:", _nsp_e)
+
+
+# ============================================================
+# PRICEBOT_ALWAYS_SHOW_DOSAGE_FORM_V3
+# يفرض ظهور الشكل الدوائي لكل صنف في رد الخيارات
+# ============================================================
+
+def _pb_clean_value(v):
+    try:
+        s = str(v or "").strip()
+    except Exception:
+        return ""
+    s = s.replace("\\n", " ").replace("\n", " ").replace("\r", " ")
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s.strip()
+
+def _pb_pick(item, keys):
+    if not isinstance(item, dict):
+        return ""
+    for k in keys:
+        v = _pb_clean_value(item.get(k))
+        if v:
+            return v
+    return ""
+
+def _pb_product_name(item):
+    try:
+        if "product_label" in globals() and callable(product_label):
+            name = _pb_clean_value(product_label(item))
+            if name:
+                return name
+    except Exception:
+        pass
+    return (
+        _pb_pick(item, ["name", "product", "product_name", "title", "اسم المنتج", "الصنف"])
+        or "منتج"
+    )
+
+def _pb_infer_dosage_form(item):
+    explicit = _pb_pick(item, [
+        "form", "shape", "dosage_form", "type",
+        "الشكل", "الشكل الدوائي", "الصيغة", "نوع المنتج"
+    ])
+    if explicit:
+        return explicit
+
+    name = _pb_product_name(item)
+    all_text = " ".join([
+        name,
+        _pb_pick(item, ["category", "class", "classification", "notes", "description", "التصنيف", "ملاحظات"])
+    ]).lower()
+
+    rules = [
+        ("شراب", ["syrup", "syp", "suspension", "susp", "elixir", "شراب", "معلق"]),
+        ("أقراص", ["tablet", "tablets", "tab", "tabs", "caplet", "أقراص", "قرص", "حبوب"]),
+        ("كبسولات", ["capsule", "capsules", "cap ", "caps ", "كبسول", "كبسولة", "كبسولات"]),
+        ("حقن", ["injection", "inj", "amp", "ampoule", "vial", "حقن", "أمبول", "امبول", "فيال"]),
+        ("قطرة", ["drops", "drop", "eye drop", "ear drop", "قطرة", "نقط"]),
+        ("مرهم", ["ointment", "oint", "مرهم"]),
+        ("كريم", ["cream", "كريم"]),
+        ("جل", ["gel", "جل"]),
+        ("غسول", ["cleanser", "wash", "غسول", "لوشن غسيل"]),
+        ("لوشن", ["lotion", "لوشن"]),
+        ("شامبو", ["shampoo", "شامبو"]),
+        ("بخاخ", ["spray", "بخاخ"]),
+        ("لبوس", ["suppository", "supp", "لبوس", "تحاميل"]),
+        ("بودرة", ["powder", "pwd", "بودرة"]),
+        ("أكياس", ["sachet", "sachets", "أكياس", "كيس"]),
+        ("زجاجة", ["bottle", "زجاجة"]),
+        ("محلول", ["solution", "sol", "محلول"]),
+    ]
+
+    padded = " " + all_text + " "
+    for form, words in rules:
+        for w in words:
+            if w in padded:
+                return form
+
+    return "غير محدد في الملف"
+
+def _pb_item_lines(i, item):
+    name = _pb_product_name(item)
+
+    form = _pb_infer_dosage_form(item)
+    strength = _pb_pick(item, ["strength", "concentration", "dose", "dosage", "التركيز", "الجرعة"])
+    company = _pb_pick(item, ["company", "brand", "manufacturer", "الشركة", "الماركة"])
+    price = _pb_pick(item, ["price", "sale_price", "unit_price", "السعر"])
+    available = _pb_pick(item, ["available", "availability", "status", "الحالة"]) or "متوفر"
+
+    lines = []
+    lines.append(f"{i}) {name}")
+    lines.append(f"   الشكل الدوائي: {form}")
+
+    if strength:
+        lines.append(f"   التركيز: {strength}")
+
+    if company:
+        lines.append(f"   الشركة: {company}")
+
+    lines.append(f"   الحالة: {available}")
+
+    if price:
+        if "د" in price:
+            lines.append(f"   السعر: {price}")
+        else:
+            lines.append(f"   السعر: {price} د.ل")
+
+    return "\n".join(lines)
+
+def build_options_reply(items, reason=""):
+    try:
+        items = list(items or [])
+    except Exception:
+        items = []
+
+    header = pharmacy_name() + " 🌿" if "pharmacy_name" in globals() else "الصيدلية 🌿"
+
+    if not items:
+        return (
+            f"{header}\n\n"
+            "لم أجد المنتج في قائمة الصيدلية بدقة.\n"
+            "اكتب الاسم كما هو مكتوب على العلبة أو أرسل صورة أوضح."
+        )
+
+    shown = items[:6]
+
+    msg = [
+        header,
+        "",
+        "متوفر ✅",
+        "يوجد أكثر من خيار قريب من طلبك.",
+        "اكتب رقم المنتج المطلوب فقط:",
+        "",
+    ]
+
+    for i, item in enumerate(shown, 1):
+        msg.append(_pb_item_lines(i, item))
+        msg.append("")
+
+    msg.append("ملاحظة: البوت يعرض السعر والتوفر فقط، ولا يحدد العلاج أو الجرعات.")
+
+    return "\n".join(msg).strip()
+
+print("PRICEBOT_ALWAYS_SHOW_DOSAGE_FORM_V3 loaded")
+
+
+# ============================================================
+# PRICEBOT_STRICT_NUMBER_CODE_SEARCH_V1
+# إذا الزبون كتب رقم/كود مثل 123 أو 123syp:
+# لا تعرض إلا المنتجات التي تحتوي هذا الرقم/الكود في الاسم أو الكود
+# حتى لا تظهر نتائج غلط مثل Seroquel أو Trajenta بسبب fuzzy search
+# ============================================================
+
+import re as _pb_re
+import functools as _pb_functools
+import inspect as _pb_inspect
+
+def _pb_norm_for_code_search(v):
+    try:
+        s = str(v or "").lower().strip()
+    except Exception:
+        return ""
+    s = s.replace("\\n", " ").replace("\n", " ").replace("\r", " ")
+    s = s.replace("-", " ").replace("_", " ").replace("/", " ")
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s.strip()
+
+def _pb_extract_code_tokens_from_query(q):
+    q = _pb_norm_for_code_search(q)
+    if not q:
+        return []
+
+    # يلتقط: 123 / 123syp / abc123 / 500mg
+    raw = _pb_re.findall(r"[a-zA-Z]*\d+[a-zA-Z]*", q)
+
+    tokens = []
+    for t in raw:
+        t = t.strip().lower()
+        if not t:
+            continue
+
+        # تجنب أرقام طويلة جدًا مثل أرقام الهاتف
+        digits = _pb_re.sub(r"\D+", "", t)
+        if len(digits) > 8:
+            continue
+
+        tokens.append(t)
+
+        # لو كتب 123syp نخلي 123 أيضًا كاحتمال
+        if digits and digits != t:
+            tokens.append(digits)
+
+    # إزالة التكرار مع الحفاظ على الترتيب
+    seen = set()
+    out = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+def _pb_item_code_text(item):
+    if not isinstance(item, dict):
+        try:
+            item = dict(item)
+        except Exception:
+            return ""
+
+    # مهم: لا نستخدم السعر ولا التوفر في المطابقة
+    # فقط الاسم/الكود/الباركود/الشركة/التركيز/الشكل
+    keys = [
+        "name", "product", "product_name", "title", "اسم المنتج", "الصنف",
+        "code", "sku", "barcode", "bar_code", "item_code", "كود", "باركود",
+        "company", "brand", "manufacturer", "الشركة", "الماركة",
+        "strength", "concentration", "dose", "dosage", "التركيز", "الجرعة",
+        "form", "shape", "dosage_form", "type", "الشكل", "الشكل الدوائي",
+        "aliases", "alias", "search_name"
+    ]
+
+    parts = []
+    for k in keys:
+        v = item.get(k, "")
+        if isinstance(v, (list, tuple, set)):
+            parts.extend([_pb_norm_for_code_search(x) for x in v])
+        else:
+            parts.append(_pb_norm_for_code_search(v))
+
+    return " ".join([x for x in parts if x])
+
+def _pb_filter_numeric_code_results(query, result):
+    tokens = _pb_extract_code_tokens_from_query(query)
+    if not tokens:
+        return result
+
+    def filter_list(items):
+        if not isinstance(items, list):
+            return items
+
+        # فقط إذا القائمة تبدو منتجات
+        dict_items = [x for x in items if isinstance(x, dict)]
+        if not dict_items:
+            return items
+
+        strict = []
+        for item in items:
+            txt = _pb_item_code_text(item)
+            if not txt:
+                continue
+
+            # شرط صارم: الرقم/الكود لازم يظهر في نص المنتج نفسه
+            if any(t in txt for t in tokens):
+                strict.append(item)
+
+        # إذا الزبون كتب كود/رقم لا نرجع للنتائج العامة
+        return strict
+
+    if isinstance(result, list):
+        return filter_list(result)
+
+    # بعض الدوال ترجع (items, reason)
+    if isinstance(result, tuple) and result:
+        first = result[0]
+        if isinstance(first, list):
+            new_first = filter_list(first)
+            return (new_first,) + result[1:]
+
+    # بعض الدوال ترجع {"items": [...]}
+    if isinstance(result, dict):
+        for key in ["items", "products", "matches", "results"]:
+            if isinstance(result.get(key), list):
+                result = dict(result)
+                result[key] = filter_list(result[key])
+                return result
+
+    return result
+
+def _pb_get_query_from_call(args, kwargs):
+    for k in ["query", "q", "text", "message", "user_text", "term", "search"]:
+        if k in kwargs and isinstance(kwargs[k], str):
+            return kwargs[k]
+
+    for a in args:
+        if isinstance(a, str):
+            return a
+
+    return ""
+
+def _pb_wrap_search_func(_name, _fn):
+    if getattr(_fn, "_pb_strict_number_wrapped", False):
+        return _fn
+
+    if _pb_inspect.iscoroutinefunction(_fn):
+        @_pb_functools.wraps(_fn)
+        async def _async_wrapper(*args, **kwargs):
+            q = _pb_get_query_from_call(args, kwargs)
+            res = await _fn(*args, **kwargs)
+            return _pb_filter_numeric_code_results(q, res)
+        _async_wrapper._pb_strict_number_wrapped = True
+        return _async_wrapper
+
+    @_pb_functools.wraps(_fn)
+    def _wrapper(*args, **kwargs):
+        q = _pb_get_query_from_call(args, kwargs)
+        res = _fn(*args, **kwargs)
+        return _pb_filter_numeric_code_results(q, res)
+
+    _wrapper._pb_strict_number_wrapped = True
+    return _wrapper
+
+try:
+    _candidate_words = ("search", "find", "match", "lookup")
+    _skip_words = ("route", "admin", "merchant", "upload", "save", "delete", "login", "logout")
+
+    _wrapped = []
+    for _n, _obj in list(globals().items()):
+        if not callable(_obj):
+            continue
+        if _n.startswith("_pb_"):
+            continue
+        _lower = _n.lower()
+
+        if not any(w in _lower for w in _candidate_words):
+            continue
+
+        # لا نغلف صفحات الأدمن والروابط
+        if any(w in _lower for w in _skip_words):
+            continue
+
+        globals()[_n] = _pb_wrap_search_func(_n, _obj)
+        _wrapped.append(_n)
+
+    print("PRICEBOT_STRICT_NUMBER_CODE_SEARCH_V1 loaded wrappers=", _wrapped)
+except Exception as _pb_e:
+    print("PRICEBOT_STRICT_NUMBER_CODE_SEARCH_V1 error:", _pb_e)
+
+
+# ============================================================
+# PRICEBOT_FORMS_AND_ARABIC_ALIASES_V1
+# إصلاح:
+# 1) syr / syp / susp / supp / tab / cap إلخ
+# 2) كونجستال => congestal
+# 3) منع عرض نتائج عشوائية إذا الاسم العربي له alias واضح
+# ============================================================
+
+import re as _pb_re
+import functools as _pb_functools
+import inspect as _pb_inspect
+
+_PB_ARABIC_PRODUCT_ALIASES = {
+    "كونجستال": ["congestal", "congstal", "conjestal"],
+    "كونجيستال": ["congestal", "congstal", "conjestal"],
+    "كونجستيل": ["congestal", "congstal", "conjestal"],
+    "بنادول": ["panadol", "paracetamol"],
+    "باراسيتامول": ["paracetamol", "panadol", "adol"],
+    "ادول": ["adol", "paracetamol"],
+    "أدول": ["adol", "paracetamol"],
+    "فلاجيل": ["flagyl", "metronidazole"],
+    "ميترونيدازول": ["metronidazole", "flagyl"],
+    "اوجمنتين": ["augmentin", "amoxiclav", "amoxicillin clavulanate"],
+    "أوجمنتين": ["augmentin", "amoxiclav", "amoxicillin clavulanate"],
+    "بروفين": ["brufen", "ibuprofen"],
+    "ايبوبروفين": ["ibuprofen", "brufen"],
+    "اوميز": ["omez", "omeprazole"],
+    "اوميبرازول": ["omeprazole", "omez"],
+    "كلاريتين": ["claritine", "loratadine"],
+    "زيرتك": ["zyrtec", "cetirizine"],
+    "سيروكويل": ["seroquel", "quetiapine"],
+    "تراجينتا": ["trajenta", "linagliptin"],
+}
+
+def _pb_clean_value(v):
+    try:
+        s = str(v or "").strip()
+    except Exception:
+        return ""
+    s = s.replace("\\n", " ").replace("\n", " ").replace("\r", " ")
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s.strip()
+
+def _pb_norm_text(v):
+    s = _pb_clean_value(v).lower()
+    s = s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    s = s.replace("ى", "ي").replace("ة", "ه")
+    s = s.replace("-", " ").replace("_", " ").replace("/", " ")
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s.strip()
+
+def _pb_pick(item, keys):
+    if not isinstance(item, dict):
+        try:
+            item = dict(item)
+        except Exception:
+            return ""
+    for k in keys:
+        v = _pb_clean_value(item.get(k))
+        if v:
+            return v
+    return ""
+
+def _pb_product_name(item):
+    try:
+        if "product_label" in globals() and callable(product_label):
+            name = _pb_clean_value(product_label(item))
+            if name:
+                return name
+    except Exception:
+        pass
+    return (
+        _pb_pick(item, ["name", "product", "product_name", "title", "اسم المنتج", "الصنف"])
+        or "منتج"
+    )
+
+def _pb_item_code_text(item):
+    if not isinstance(item, dict):
+        try:
+            item = dict(item)
+        except Exception:
+            return ""
+
+    keys = [
+        "name", "product", "product_name", "title", "اسم المنتج", "الصنف",
+        "code", "sku", "barcode", "bar_code", "item_code", "كود", "باركود",
+        "company", "brand", "manufacturer", "الشركة", "الماركة",
+        "strength", "concentration", "dose", "dosage", "التركيز", "الجرعة",
+        "form", "shape", "dosage_form", "type", "الشكل", "الشكل الدوائي",
+        "aliases", "alias", "search_name", "category", "notes", "description"
+    ]
+
+    parts = []
+    for k in keys:
+        v = item.get(k, "") if isinstance(item, dict) else ""
+        if isinstance(v, (list, tuple, set)):
+            parts.extend([_pb_norm_text(x) for x in v])
+        else:
+            parts.append(_pb_norm_text(v))
+
+    return " ".join([x for x in parts if x])
+
+def _pb_alias_tokens_for_query(q):
+    qn = _pb_norm_text(q)
+    out = []
+
+    for ar, aliases in _PB_ARABIC_PRODUCT_ALIASES.items():
+        arn = _pb_norm_text(ar)
+        if arn and arn in qn:
+            out.extend([arn])
+            out.extend([_pb_norm_text(x) for x in aliases])
+
+    seen = set()
+    final = []
+    for x in out:
+        if x and x not in seen:
+            seen.add(x)
+            final.append(x)
+    return final
+
+def _pb_expand_query_with_alias(q):
+    q = _pb_clean_value(q)
+    toks = _pb_alias_tokens_for_query(q)
+    if not toks:
+        return q
+    return (q + " " + " ".join(toks)).strip()
+
+def _pb_filter_alias_results(original_q, result):
+    toks = _pb_alias_tokens_for_query(original_q)
+    if not toks:
+        return result
+
+    def flt(items):
+        if not isinstance(items, list):
+            return items
+        if not any(isinstance(x, dict) for x in items):
+            return items
+
+        strict = []
+        for item in items:
+            txt = _pb_item_code_text(item)
+            if any(t in txt for t in toks):
+                strict.append(item)
+
+        # مهم: إذا الاسم له alias واضح ولم نجد شيء، لا نرجع نتائج عشوائية مثل Adol
+        return strict
+
+    if isinstance(result, list):
+        return flt(result)
+
+    if isinstance(result, tuple) and result and isinstance(result[0], list):
+        return (flt(result[0]),) + result[1:]
+
+    if isinstance(result, dict):
+        for key in ["items", "products", "matches", "results"]:
+            if isinstance(result.get(key), list):
+                result = dict(result)
+                result[key] = flt(result[key])
+                return result
+
+    return result
+
+def _pb_infer_dosage_form(item):
+    explicit = _pb_pick(item, [
+        "form", "shape", "dosage_form", "type",
+        "الشكل", "الشكل الدوائي", "الصيغة", "نوع المنتج"
+    ])
+    if explicit:
+        return explicit
+
+    name = _pb_product_name(item)
+    all_text = " " + _pb_norm_text(" ".join([
+        name,
+        _pb_pick(item, ["category", "class", "classification", "notes", "description", "التصنيف", "ملاحظات"])
+    ])) + " "
+
+    rules = [
+        ("شراب", [" syrup ", " syr ", " syp ", " susp ", " suspension ", " elixir ", " شراب ", " معلق "]),
+        ("أقراص", [" tablet ", " tablets ", " tab ", " tabs ", " caplet ", " أقراص ", " اقراص ", " قرص ", " حبوب "]),
+        ("كبسولات", [" capsule ", " capsules ", " cap ", " caps ", " كبسول ", " كبسوله ", " كبسولات "]),
+        ("لبوس", [" suppository ", " suppositories ", " supp ", " لبوس ", " تحاميل "]),
+        ("حقن", [" injection ", " inj ", " amp ", " ampoule ", " vial ", " حقن ", " امبول ", " فيال "]),
+        ("قطرة", [" drops ", " drop ", " eye drop ", " ear drop ", " قطرة ", " قطره ", " نقط "]),
+        ("مرهم", [" ointment ", " oint ", " مرهم "]),
+        ("كريم", [" cream ", " كريم "]),
+        ("جل", [" gel ", " جل "]),
+        ("غسول", [" cleanser ", " wash ", " غسول "]),
+        ("لوشن", [" lotion ", " لوشن "]),
+        ("شامبو", [" shampoo ", " شامبو "]),
+        ("بخاخ", [" spray ", " بخاخ "]),
+        ("بودرة", [" powder ", " pwd ", " بودرة ", " بودره "]),
+        ("أكياس", [" sachet ", " sachets ", " اكياس ", " كيس "]),
+        ("محلول", [" solution ", " sol ", " محلول "]),
+    ]
+
+    for form, words in rules:
+        for w in words:
+            if w in all_text:
+                return form
+
+    # لو فيه ml فقط بدون كلمة syr/drop: نكتب سائل بدل غير محدد
+    if _pb_re.search(r"\b\d+(\.\d+)?\s*ml\b", all_text):
+        return "سائل"
+
+    return "غير واضح من الاسم"
+
+def _pb_item_lines(i, item):
+    name = _pb_product_name(item)
+
+    form = _pb_infer_dosage_form(item)
+    strength = _pb_pick(item, ["strength", "concentration", "dose", "dosage", "التركيز", "الجرعة"])
+    company = _pb_pick(item, ["company", "brand", "manufacturer", "الشركة", "الماركة"])
+    price = _pb_pick(item, ["price", "sale_price", "unit_price", "السعر"])
+    available = _pb_pick(item, ["available", "availability", "status", "الحالة"]) or "متوفر"
+
+    lines = []
+    lines.append(f"{i}) {name}")
+    lines.append(f"   الشكل الدوائي: {form}")
+
+    if strength:
+        lines.append(f"   التركيز: {strength}")
+
+    if company:
+        lines.append(f"   الشركة: {company}")
+
+    lines.append(f"   الحالة: {available}")
+
+    if price:
+        if "د" in price:
+            lines.append(f"   السعر: {price}")
+        else:
+            lines.append(f"   السعر: {price} د.ل")
+
+    return "\n".join(lines)
+
+def build_options_reply(items, reason=""):
+    try:
+        items = list(items or [])
+    except Exception:
+        items = []
+
+    header = pharmacy_name() + " 🌿" if "pharmacy_name" in globals() else "الصيدلية 🌿"
+
+    if not items:
+        return (
+            f"{header}\n\n"
+            "غير متوفر أو غير موجود في قائمة الصيدلية حاليًا.\n"
+            "تأكد من الاسم أو اكتب الاسم كما هو مكتوب على العلبة."
+        )
+
+    shown = items[:6]
+
+    msg = [
+        header,
+        "",
+        "متوفر ✅",
+        "يوجد أكثر من خيار قريب من طلبك.",
+        "اكتب رقم المنتج المطلوب فقط:",
+        "",
+    ]
+
+    for i, item in enumerate(shown, 1):
+        msg.append(_pb_item_lines(i, item))
+        msg.append("")
+
+    msg.append("ملاحظة: البوت يعرض السعر والتوفر فقط، ولا يحدد العلاج أو الجرعات.")
+
+    return "\n".join(msg).strip()
+
+def _pb_get_query_from_call(args, kwargs):
+    for k in ["query", "q", "text", "message", "user_text", "term", "search"]:
+        if k in kwargs and isinstance(kwargs[k], str):
+            return kwargs[k], "kw", k
+
+    for idx, a in enumerate(args):
+        if isinstance(a, str):
+            return a, "arg", idx
+
+    return "", "", None
+
+def _pb_replace_query_in_call(args, kwargs, expanded, where, key):
+    args = list(args)
+    kwargs = dict(kwargs)
+    if where == "kw":
+        kwargs[key] = expanded
+    elif where == "arg":
+        args[key] = expanded
+    return tuple(args), kwargs
+
+def _pb_wrap_alias_search_func(_name, _fn):
+    if getattr(_fn, "_pb_alias_wrapped", False):
+        return _fn
+
+    if _pb_inspect.iscoroutinefunction(_fn):
+        @_pb_functools.wraps(_fn)
+        async def _async_wrapper(*args, **kwargs):
+            q, where, key = _pb_get_query_from_call(args, kwargs)
+            expanded = _pb_expand_query_with_alias(q)
+            if expanded != q:
+                args2, kwargs2 = _pb_replace_query_in_call(args, kwargs, expanded, where, key)
+            else:
+                args2, kwargs2 = args, kwargs
+            res = await _fn(*args2, **kwargs2)
+            return _pb_filter_alias_results(q, res)
+        _async_wrapper._pb_alias_wrapped = True
+        return _async_wrapper
+
+    @_pb_functools.wraps(_fn)
+    def _wrapper(*args, **kwargs):
+        q, where, key = _pb_get_query_from_call(args, kwargs)
+        expanded = _pb_expand_query_with_alias(q)
+        if expanded != q:
+            args2, kwargs2 = _pb_replace_query_in_call(args, kwargs, expanded, where, key)
+        else:
+            args2, kwargs2 = args, kwargs
+        res = _fn(*args2, **kwargs2)
+        return _pb_filter_alias_results(q, res)
+
+    _wrapper._pb_alias_wrapped = True
+    return _wrapper
+
+try:
+    _wrapped_alias = []
+    for _n, _obj in list(globals().items()):
+        if not callable(_obj):
+            continue
+        if _n.startswith("_pb_"):
+            continue
+        low = _n.lower()
+        if any(w in low for w in ["search", "find", "match", "lookup"]):
+            if not any(w in low for w in ["route", "admin", "merchant", "upload", "save", "delete", "login", "logout"]):
+                globals()[_n] = _pb_wrap_alias_search_func(_n, _obj)
+                _wrapped_alias.append(_n)
+    print("PRICEBOT_FORMS_AND_ARABIC_ALIASES_V1 loaded wrappers=", _wrapped_alias)
+except Exception as _pb_e:
+    print("PRICEBOT_FORMS_AND_ARABIC_ALIASES_V1 error:", _pb_e)
+
+
