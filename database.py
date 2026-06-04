@@ -21,9 +21,11 @@ def get_db_connection() -> sqlite3.Connection:
     return conn
 
 def init_db():
-    """تهيئة الجداول وعمل Migration للبيانات القديمة"""
+    """تهيئة الجداول وعمل Migration للبيانات القديمة باحترافية"""
     with get_db_connection() as conn:
-        # 1. جدول المنتجات
+        # -------------------------------------------
+        # 1. جدول المنتجات (Migration)
+        # -------------------------------------------
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +33,6 @@ def init_db():
             )
         """)
         
-        # Migration الآمن لكل الأعمدة التي طلبها المشرف
         cursor = conn.execute("PRAGMA table_info(products)")
         existing_columns = [col["name"] for col in cursor.fetchall()]
         
@@ -47,27 +48,49 @@ def init_db():
             "available": "TEXT DEFAULT 'متوفر'",
             "notes": "TEXT DEFAULT ''",
             "image": "TEXT DEFAULT ''",
-            "normalized_name": "TEXT DEFAULT ''" # جديد لضمان دقة الرفع وعدم التكرار (النقطة 22)
+            "normalized_name": "TEXT DEFAULT ''"
         }
-        
         for col, dtype in required_columns.items():
             if col not in existing_columns:
                 conn.execute(f"ALTER TABLE products ADD COLUMN {col} {dtype}")
                 print(f"Migration: Added column '{col}' to products table.")
 
-        # 2. جدول الطلبات
+        # -------------------------------------------
+        # 2. جدول الطلبات (Migration لإصلاح النقطة 1)
+        # -------------------------------------------
         conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT,
-                product_name TEXT,
-                price TEXT,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                phone TEXT
             )
         """)
         
-        # 3. (النقطة 3) جدول منع التكرار المحدث
+        cursor_orders = conn.execute("PRAGMA table_info(orders)")
+        existing_order_cols = [col["name"] for col in cursor_orders.fetchall()]
+        
+        order_cols_needed = {
+            "product_name": "TEXT",
+            "price": "TEXT",
+            "status": "TEXT DEFAULT 'pending'",
+            "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        }
+        
+        for col, dtype in order_cols_needed.items():
+            if col not in existing_order_cols:
+                conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {dtype}")
+                print(f"Migration: Added column '{col}' to orders table.")
+                
+        # نقل البيانات من العمود القديم (product) إذا كان موجوداً لحفظ الطلبات السابقة
+        if "product" in existing_order_cols and "product_name" not in existing_order_cols:
+            try:
+                conn.execute("UPDATE orders SET product_name = product WHERE product_name IS NULL")
+                print("Migration: Migrated old 'product' data to 'product_name'.")
+            except Exception as e:
+                print(f"Migration Orders Error: {e}")
+
+        # -------------------------------------------
+        # 3. جدول منع التكرار (النقطة 5)
+        # -------------------------------------------
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_messages (
                 message_id TEXT PRIMARY KEY,
@@ -76,7 +99,9 @@ def init_db():
             )
         """)
         
+        # -------------------------------------------
         # 4. جدول حالة الزبون
+        # -------------------------------------------
         conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_state (
                 phone TEXT PRIMARY KEY,
@@ -87,24 +112,42 @@ def init_db():
         conn.commit()
 
 # ==========================================
-# (النقطة 3) نظام الحماية من تكرار الرسائل (المعدل)
+# الحماية من التكرار مع نظام Retry الذكي (النقطة 5)
 # ==========================================
 def start_processing_message(message_id: str) -> bool:
-    """إرجاع True إذا كانت الرسالة جديدة وتم تسجيلها للبدء. إرجاع False إذا تمت معالجتها أو جاري معالجتها."""
+    """يسمح بمعالجة الرسالة إذا كانت جديدة، أو فاشلة، أو عالقة لأكثر من 5 دقائق"""
     if not message_id: return False
     with get_db_connection() as conn:
-        row = conn.execute("SELECT status FROM processed_messages WHERE message_id=?", (message_id,)).fetchone()
+        row = conn.execute("SELECT status, updated_at FROM processed_messages WHERE message_id=?", (message_id,)).fetchone()
+        
         if row:
-            # إذا كانت status = done، نتجاهلها. إذا failed، ممكن نسمح بمعالجتها مرة أخرى لاحقاً لو طلبنا.
-            # حالياً نمنع التكرار طالما هي مسجلة.
-            return False
+            status = row["status"]
+            updated_at_str = row["updated_at"]
             
-        conn.execute("INSERT INTO processed_messages (message_id, status) VALUES (?, 'processing')", (message_id,))
+            try:
+                # حساب فرق الوقت منذ آخر تحديث (لمعالجة الرسائل العالقة بسبب Restart)
+                updated_at = datetime.strptime(updated_at_str, "%Y-%m-%d %H:%M:%S")
+                diff_minutes = (datetime.utcnow() - updated_at).total_seconds() / 60.0
+            except:
+                diff_minutes = 10 # السماح بالمحاولة إذا فشل حساب الوقت
+                
+            if status == "done":
+                return False # تمت بنجاح مسبقاً، تجاهل.
+                
+            if status == "failed" or (status == "processing" and diff_minutes > 5):
+                # إعادة المحاولة وتحديث الوقت
+                conn.execute("UPDATE processed_messages SET status='processing', updated_at=CURRENT_TIMESTAMP WHERE message_id=?", (message_id,))
+                conn.commit()
+                return True
+                
+            return False # قيد المعالجة حديثاً، تجاهل.
+            
+        # رسالة جديدة تماماً
+        conn.execute("INSERT INTO processed_messages (message_id, status, updated_at) VALUES (?, 'processing', CURRENT_TIMESTAMP)", (message_id,))
         conn.commit()
         return True
 
 def mark_message_done(message_id: str, final_status: str = 'done'):
-    """يتم استدعاءها فقط بعد الإرسال النهائي لضمان عدم ضياع الرسالة في حال حدوث Error (النقطة 3)"""
     if not message_id: return
     with get_db_connection() as conn:
         conn.execute("UPDATE processed_messages SET status=?, updated_at=CURRENT_TIMESTAMP WHERE message_id=?", (final_status, message_id))
@@ -166,7 +209,6 @@ def load_products() -> List[dict]:
         return []
 
 def backup_database():
-    """نسخ احتياطي منظم في مجلد backups"""
     if not DB_FILE.exists(): return
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -174,10 +216,9 @@ def backup_database():
     backup_path = BACKUPS_DIR / backup_name
     try:
         shutil.copy(DB_FILE, backup_path)
-        print(f"✅ Backup created successfully: {backup_path}")
+        print(f"✅ Backup created: {backup_name}")
     except Exception as e:
         print(f"❌ Backup failed: {e}")
 
-# التأكد من التهيئة
+# التأكد من التهيئة عند بدء التشغيل
 init_db()
-
