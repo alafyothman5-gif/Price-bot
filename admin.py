@@ -13,7 +13,7 @@ import matcher
 load_dotenv()
 ADMIN_KEY = os.getenv("ADMIN_KEY", "PriceBotAdmin2026")
 
-# (النقطة 24) ضبط مسار اللوحة
+# (النقطة 24) ضبط مسار اللوحة للعمل بدون Slash في النهاية
 router = APIRouter(prefix="/admin", tags=["Admin Panel"])
 
 # ==========================================
@@ -46,7 +46,7 @@ def get_html_header(key: str, title="لوحة تحكم الصيدلية"):
             .bg-pending {{ background-color: #f39c12; }}
             .bg-completed {{ background-color: #2ecc71; }}
             .bg-canceled {{ background-color: #e74c3c; }}
-            #searchInput {{ width: 100%; padding: 12px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; font-size: 16px; }}
+            .search-box {{ width: 100%; padding: 12px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; font-size: 16px; }}
         </style>
     </head>
     <body>
@@ -86,11 +86,17 @@ async def dashboard(key: str = Depends(verify_admin)):
     return html_content
 
 # ==========================================
-# صفحة إدارة المنتجات ورفع الملفات
+# صفحة إدارة المنتجات والبحث (النقطة 13)
 # ==========================================
 @router.get("/products", response_class=HTMLResponse)
-async def manage_products(key: str = Depends(verify_admin)):
+async def manage_products(q: str = "", key: str = Depends(verify_admin)):
     products = database.load_products()
+    
+    # محرك بحث السيرفر (Server-Side Search)
+    if q:
+        q_norm = matcher.normalize_text(q)
+        products = [p for p in products if q_norm in matcher.normalize_text(p.get('name', '')) or q_norm in matcher.normalize_text(p.get('aliases', ''))]
+
     html_content = get_html_header(key, "إدارة الأدوية")
     html_content += f"""
         <h2>رفع قائمة الأدوية (CSV أو Excel XLSX)</h2>
@@ -99,29 +105,34 @@ async def manage_products(key: str = Depends(verify_admin)):
             <input type="file" name="file" accept=".csv, .xlsx" required style="margin-bottom: 15px;"><br>
             
             <input type="checkbox" id="replace_all" name="replace_all" value="yes">
-            <label for="replace_all" style="color: red; font-weight: bold;">استبدال كامل (حذف كل المنتجات القديمة)</label>
-            <p style="font-size: 12px; color: gray;">* إذا لم تقم بتحديد المربع، سيتم تحديث الأدوية الموجودة وإضافة الجديدة فقط بشكل آمن.</p>
+            <label for="replace_all" style="color: red; font-weight: bold;">استبدال كامل (حذف كل المنتجات القديمة)</label><br>
             
+            <input type="checkbox" id="force_confirm" name="force_confirm" value="yes">
+            <label for="force_confirm" style="color: darkred; font-weight: bold;">تأكيد إجباري للحذف (تخطي حماية العدد)</label>
+            
+            <p style="font-size: 12px; color: gray;">* إذا لم تقم بتحديد استبدال كامل، سيتم تحديث الأدوية الموجودة وإضافة الجديدة فقط بشكل آمن.</p>
             <button type="submit" class="btn btn-success">رفع وتحديث 🚀</button>
         </form>
 
-        <h2>قائمة الأدوية المتوفرة</h2>
-        <input type="text" id="searchInput" onkeyup="searchTable()" placeholder="🔍 ابحث عن منتج بالاسم...">
+        <h2>البحث وقائمة الأدوية</h2>
+        <form method="get" action="/admin/products" style="margin-bottom: 20px;">
+            <input type="hidden" name="key" value="{key}">
+            <input type="text" name="q" value="{html.escape(q)}" class="search-box" placeholder="🔍 ابحث عن منتج بالاسم وادخل (Enter)...">
+        </form>
         
-        <table id="productsTable">
-            <tr><th>الرقم</th><th>الاسم</th><th>السعر</th><th>الشركة</th><th>إجراء</th></tr>
+        <table>
+            <tr><th>الرقم</th><th>الاسم</th><th>السعر</th><th>الشركة</th><th>التوفر</th><th>إجراء</th></tr>
     """
     
-    # عرض أول 250 منتج لتخفيف الحمل على المتصفح
-    for p in products[:250]: 
-        # (النقطة 27) حماية XSS
+    for p in products[:250]: # عرض 250 لتسريع الصفحة بعد البحث
         safe_name = html.escape(str(p.get('name', '')))
         safe_price = html.escape(str(p.get('price', '')))
         safe_company = html.escape(str(p.get('company', '-')))
+        safe_avail = html.escape(str(p.get('available', 'متوفر')))
         
         html_content += f"""
             <tr>
-                <td>{p['id']}</td><td>{safe_name}</td><td>{safe_price}</td><td>{safe_company}</td>
+                <td>{p['id']}</td><td>{safe_name}</td><td>{safe_price}</td><td>{safe_company}</td><td>{safe_avail}</td>
                 <td>
                     <form action="/admin/products/delete/{p['id']}?key={key}" method="post" style="display:inline;">
                         <button type="submit" class="btn btn-danger" onclick="return confirm('تأكيد الحذف؟ سيتم أخذ نسخة احتياطية أولاً.')">حذف</button>
@@ -132,33 +143,11 @@ async def manage_products(key: str = Depends(verify_admin)):
         
     html_content += """
         </table>
-        <p style='text-align:center; color:gray; font-size:12px; margin-top:10px;'>يتم عرض أحدث 250 منتج لتسريع اللوحة. يمكنك البحث ضمنها.</p>
-        
-        <script>
-        function searchTable() {
-            var input, filter, table, tr, td, i, txtValue;
-            input = document.getElementById("searchInput");
-            filter = input.value.toUpperCase();
-            table = document.getElementById("productsTable");
-            tr = table.getElementsByTagName("tr");
-            for (i = 1; i < tr.length; i++) {
-                td = tr[i].getElementsByTagName("td")[1]; // البحث يتم في عمود الاسم
-                if (td) {
-                    txtValue = td.textContent || td.innerText;
-                    if (txtValue.toUpperCase().indexOf(filter) > -1) {
-                        tr[i].style.display = "";
-                    } else {
-                        tr[i].style.display = "none";
-                    }
-                }       
-            }
-        }
-        </script>
+        <p style='text-align:center; color:gray; font-size:12px; margin-top:10px;'>يتم عرض 250 منتج كحد أقصى لتسريع اللوحة. استخدم شريط البحث للعثور على أي منتج.</p>
     </div></body></html>
     """
     return html_content
 
-# (النقطة 21) التعرف الذكي على أسماء الأعمدة في الإكسيل
 def map_header(header: str) -> str:
     h = str(header).strip().lower()
     if h in ['name', 'product', 'product_name', 'اسم المنتج', 'المنتج', 'الاسم', 'الصنف']: return 'name'
@@ -174,16 +163,16 @@ def map_header(header: str) -> str:
 async def upload_file(
     file: UploadFile = File(...), 
     replace_all: str = Form(None),
+    force_confirm: str = Form(None),
     key: str = Depends(verify_admin)
 ):
-    # أخذ نسخة احتياطية قبل الرفع
     database.backup_database()
-    
     content = await file.read()
     filename = file.filename.lower()
     parsed_data = []
 
     try:
+        # قراءة الملف أولاً
         if filename.endswith(".csv"):
             decoded = content.decode('utf-8-sig')
             reader = csv.reader(io.StringIO(decoded))
@@ -195,15 +184,35 @@ async def upload_file(
                     
         elif filename.endswith(".xlsx"):
             wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-            sheet = wb.active
-            rows = list(sheet.values)
+            
+            # (النقطة 12) البحث الذكي عن الصفحة الصحيحة
+            target_sheet = None
+            for sheet_name in ["Products", "Products_Bot_Ready", "المنتجات", "products"]:
+                if sheet_name in wb.sheetnames:
+                    target_sheet = wb[sheet_name]
+                    break
+            if not target_sheet:
+                # اختيار الصفحة التي تحتوي على أكثر عدد صفوف كإجراء احتياطي
+                target_sheet = max(wb.worksheets, key=lambda s: s.max_row)
+                
+            rows = list(target_sheet.values)
             if len(rows) > 0:
                 headers = [map_header(h) for h in rows[0]]
                 for row in rows[1:]:
-                    parsed_data.append(dict(zip(headers, row)))
+                    if any(row): # التأكد أن السطر غير فارغ
+                        parsed_data.append(dict(zip(headers, row)))
         else:
             raise HTTPException(400, "صيغة الملف غير مدعومة. يرجى رفع CSV أو XLSX")
             
+        # (النقطة 11) حماية المسح الكامل
+        current_products_count = len(database.load_products())
+        if replace_all == "yes":
+            if len(parsed_data) < 100 or len(parsed_data) < (0.7 * current_products_count):
+                if force_confirm != "yes":
+                    err_msg = f"تحذير للحماية: الملف المرفوع يحتوي على {len(parsed_data)} دواء فقط، بينما الصيدلية بها {current_products_count} دواء! المسح الكامل تم رفضه. إذا كنت متأكداً، ضع علامة صح على (تأكيد إجباري)."
+                    return HTMLResponse(f"<div dir='rtl' style='color:red;font-family:Arial;text-align:center;margin-top:50px;'><h2>{err_msg}</h2><br><a href='/admin/products?key={key}'>عودة</a></div>")
+
+        # بدء الرفع وقاعدة البيانات
         with database.get_db_connection() as conn:
             if replace_all == "yes":
                 conn.execute("DELETE FROM products")
@@ -219,9 +228,7 @@ async def upload_file(
                 company = str(row.get("company", "")).strip()
                 available = str(row.get("available", "متوفر")).strip()
                 
-                # (النقطة 22) إنشاء اسم مفلتر لمنع التكرار
                 norm_name = matcher.normalize_text(name)
-                
                 existing = conn.execute("SELECT id FROM products WHERE normalized_name=? OR name=?", (norm_name, name)).fetchone()
                 
                 if existing:
@@ -238,13 +245,12 @@ async def upload_file(
             conn.commit()
             
     except Exception as e:
-        raise HTTPException(500, f"حدث خطأ أثناء معالجة الملف: {str(e)}")
+        return HTMLResponse(f"<div dir='rtl' style='color:red;font-family:Arial;text-align:center;margin-top:50px;'><h2>حدث خطأ أثناء معالجة الملف: {str(e)}</h2><br><a href='/admin/products?key={key}'>عودة</a></div>")
         
     return RedirectResponse(url=f"/admin/products?key={key}", status_code=303)
 
 @router.post("/products/delete/{product_id}")
 async def delete_product(product_id: int, key: str = Depends(verify_admin)):
-    # (النقطة 25) نسخة احتياطية فورية قبل الحذف الفردي
     database.backup_database()
     with database.get_db_connection() as conn:
         conn.execute("DELETE FROM products WHERE id=?", (product_id,))
