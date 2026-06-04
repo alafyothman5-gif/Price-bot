@@ -5,6 +5,7 @@ import base64
 import json
 import re
 import io
+from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from dotenv import load_dotenv
@@ -17,21 +18,32 @@ import admin
 load_dotenv()
 
 # ==========================================
-# (النقطة 2 و 4) قراءة المتغيرات بمرونة
+# 1. إعدادات السيرفر وقراءة المتغيرات المرنة
 # ==========================================
+def get_valid_key(possible_names: list) -> str:
+    """استخراج أول مفتاح صالح يفصل بينها مسافة أو سطر أو فاصلة"""
+    for name in possible_names:
+        val = os.getenv(name, "")
+        if val:
+            parts = re.split(r'[,\s\n]+', val)
+            for p in parts:
+                p = p.strip()
+                if p.startswith("sk-"): return p
+            if parts and parts[0]: return parts[0].strip()
+    return ""
+
 def get_env_var(possible_names: list, default: str = "") -> str:
     for name in possible_names:
         val = os.getenv(name)
-        if val: 
-            return str(val).split(",")[0].strip() # أخذ أول مفتاح صالح لو كان هناك عدة مفاتيح
+        if val: return str(val).strip()
     return default
 
-META_TOKEN = get_env_var(["WHATSAPP_TOKEN", "WHATSAPP_API_TOKEN", "META_TOKEN", "META_ACCESS_TOKEN", "WHATSAPP_PERMANENT_TOKEN"])
+META_TOKEN = get_valid_key(["WHATSAPP_TOKEN", "WHATSAPP_API_TOKEN", "META_TOKEN", "META_ACCESS_TOKEN", "WHATSAPP_PERMANENT_TOKEN"])
 PHONE_ID = get_env_var(["PHONE_NUMBER_ID", "WHATSAPP_PHONE_NUMBER_ID", "META_PHONE_NUMBER_ID", "META_PHONE_NUMBER_ID_1"])
 VERIFY_TOKEN = get_env_var(["VERIFY_TOKEN", "WEBHOOK_VERIFY_TOKEN", "META_VERIFY_TOKEN"], "pricebot_verify_2026")
-AI_KEYS = get_env_var(["OPENROUTER_API_KEY", "OPENROUTER_KEYS", "OPENROUTER_KEY", "AI_OPENROUTER_KEYS", "AI_OPENROUTER_KEY"])
-AI_MODEL = get_env_var(["OPENROUTER_MODEL"], "google/gemini-2.5-flash-lite")
-ADMIN_NOTIFY_PHONE = get_env_var(["ADMIN_NOTIFY_PHONE"])
+AI_KEYS = get_valid_key(["OPENROUTER_API_KEY", "OPENROUTER_KEYS", "OPENROUTER_KEY", "AI_OPENROUTER_KEYS", "AI_OPENROUTER_KEY"])
+AI_MODEL = get_env_var(["OPENROUTER_MODEL", "AI_MODEL", "AI_OPENROUTER_MODEL"], "google/gemini-2.5-flash-lite")
+ADMIN_NOTIFY_PHONE = get_env_var(["ADMIN_NOTIFY_PHONE", "CUSTOMER_WHATSAPP_NUMBER"])
 
 def mask_token(token: str):
     return f"{token[:4]}...HIDDEN" if token and len(token) > 8 else "NONE"
@@ -42,8 +54,15 @@ app.include_router(admin.router)
 http_client = httpx.AsyncClient(timeout=30.0)
 queue = asyncio.Queue()
 
+# (النقطة 4) نظام حماية التزامن لكل رقم هاتف لمنع تداخل الرسائل لنفس الزبون
+user_locks = {}
+def get_user_lock(phone: str):
+    if phone not in user_locks:
+        user_locks[phone] = asyncio.Lock()
+    return user_locks[phone]
+
 # ==========================================
-# Endpoint /health
+# 2. مسارات الفحص والاختبار (النقطة 26)
 # ==========================================
 @app.get("/health")
 async def health_check():
@@ -55,10 +74,17 @@ async def health_check():
         "version": "clean-v1"
     })
 
+@app.get("/test_local")
+async def test_local(q: str = "", phone: str = "test_user"):
+    """مسار لاختبار نصوص البوت محلياً بدون واتساب"""
+    user_state = database.get_user_state(phone)
+    reply = matcher.handle_text_query(phone, q, user_state)
+    return PlainTextResponse(f"Query: {q}\n---\n{reply}")
+
 # ==========================================
-# (النقطة 22) إرسال الرسائل مع Logs دقيقة
+# 3. إرسال الرسائل والإشعارات
 # ==========================================
-async def send_whatsapp_message(to_number: str, text: str):
+async def send_whatsapp_message(to_number: str, text: str) -> bool:
     print(f"SEND_ATTEMPT to {to_number}")
     if not META_TOKEN or not PHONE_ID:
         print("SEND_ERROR: Missing Meta Tokens")
@@ -82,13 +108,12 @@ async def send_whatsapp_message(to_number: str, text: str):
 
 async def notify_admin(message: str):
     if ADMIN_NOTIFY_PHONE:
-        await send_whatsapp_message(ADMIN_NOTIFY_PHONE, f"🔔 إشعار للأدمن:\n{message}")
+        await send_whatsapp_message(ADMIN_NOTIFY_PHONE, f"🔔 إشعار للصيدلية:\n{message}")
 
 # ==========================================
-# معالجة الصور (النقطة 16 و 19 و 21)
+# 4. معالجة الصور والذكاء الاصطناعي
 # ==========================================
 def resize_image_b64(b64_img: str) -> str:
-    """تصغير الصورة لتقليل التكلفة وتسريع المعالجة بـ Pillow"""
     try:
         img_data = base64.b64decode(b64_img)
         img = Image.open(io.BytesIO(img_data)).convert("RGB")
@@ -100,21 +125,24 @@ def resize_image_b64(b64_img: str) -> str:
         print(f"Image Resize Error: {e}")
         return b64_img
 
-def extract_robust_json(text: str) -> dict:
-    """استخراج الـ JSON حتى لو أضاف الـ AI نصوصاً قبله أو بعده"""
-    try:
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match: return json.loads(match.group(0))
-        return json.loads(text)
-    except:
-        return {}
+def extract_best_visible_name(text: str) -> str:
+    """تجاهل الأحجام واستخراج الكلمات المهمة من النص المرئي (النقطة 8)"""
+    if not text: return ""
+    lines = text.split('\n')
+    best_lines = []
+    ignore_patterns = [r'\d+\s*(ml|oz|fl\s*oz|g|mg)', 'for normal skin', 'ingredients', 'claims']
+    for line in lines:
+        line_lower = line.lower()
+        if any(re.search(pat, line_lower) for pat in ignore_patterns): continue
+        if any(w in line_lower for w in ['cleanser', 'lotion', 'serum', 'cream', 'foaming', 'hydrating', 'sa', 'effaclar', 'moisturizing', 'renewing', 'gel']):
+            best_lines.append(line.strip())
+    return " ".join(best_lines) if best_lines else lines[0]
 
 async def download_whatsapp_media(media_id: str):
     print("MEDIA_DOWNLOAD_START")
     url = f"https://graph.facebook.com/v20.0/{media_id}"
     headers = {"Authorization": f"Bearer {META_TOKEN}"}
     try:
-        # Timeouts موزونة (6s للرابط + 8s للتحميل)
         res_info = await asyncio.wait_for(http_client.get(url, headers=headers), timeout=6.0)
         media_url = res_info.json().get("url")
         if not media_url: return None
@@ -132,34 +160,94 @@ async def analyze_image_with_ai(base64_img: str):
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {"Authorization": f"Bearer {AI_KEYS}", "Content-Type": "application/json"}
     
-    # (النقطة 17) الـ Prompt الدقيق
     prompt_msg = (
-        "Analyze this image. Return ONLY JSON format:\n"
+        "Analyze this image carefully. Return ONLY valid JSON format:\n"
         "{\n"
         "\"image_type\": \"product_packaging|prescription|unclear|other\",\n"
-        "\"brand\": \"\", \"product_name\": \"\", \"product_names\": [], \"visible_text\": \"\",\n"
+        "\"brand\": \"\", \"product_name\": \"\", \"visible_text\": \"\",\n"
         "\"product_type\": \"\", \"target_area\": \"face|body|baby|hair|mouth|unknown\", \"size\": \"\",\n"
-        "\"confidence\": 0.0 to 1.0, \"clarity\": \"good|medium|bad\", \"requires_admin_review\": false\n"
+        "\"confidence\": 0.9,\n"
+        "\"clarity\": \"good|medium|bad\",\n"
+        "\"requires_admin_review\": false\n"
         "}"
     )
     payload = {
         "model": AI_MODEL,
+        "response_format": {"type": "json_object"},
         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt_msg}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}]}]
     }
+    
     try:
-        # AI Timeout (15s)
         res = await asyncio.wait_for(http_client.post(url, json=payload, headers=headers), timeout=15.0)
+        if res.status_code != 200:
+            print(f"AI_HTTP_STATUS: {res.status_code} | RESPONSE: {res.text[:500]}")
+            return None
+            
         ai_text = res.json()["choices"][0]["message"]["content"]
-        ai_data = extract_robust_json(ai_text)
-        print(f"AI_PARSED_JSON: {ai_data}")
+        match = re.search(r'\{.*\}', ai_text, re.DOTALL)
+        ai_data = json.loads(match.group(0)) if match else json.loads(ai_text)
+        print(f"AI_MODEL_USED: {AI_MODEL} | AI_PARSED_JSON: {ai_data}")
         return ai_data
     except Exception as e:
         print(f"AI_ERROR: {e}")
         return None
 
 # ==========================================
-# معالجة الرسائل الرئيسية (النقطة 31)
+# 5. معالجة الرسائل الرئيسية
 # ==========================================
+async def handle_image_logic(phone: str, image_id: str, user_state: dict) -> str:
+    b64 = await download_whatsapp_media(image_id)
+    if not b64: return "فشل تحميل الصورة من الواتساب. الرجاء كتابة اسم المنتج."
+    
+    ai_data = await analyze_image_with_ai(b64)
+    if not ai_data: return "حدث خطأ أثناء فحص الصورة بالذكاء الاصطناعي. الرجاء كتابة الاسم."
+    
+    # التعامل مع الروشتات وأنواع الصور
+    img_type = ai_data.get("image_type", "")
+    if img_type == "prescription":
+        await notify_admin(f"روشتة طبية جديدة من الرقم:\n{phone}")
+        return "الصورة تبدو كوصفة طبية (روشتة). تم تحويلها للصيدلي للمراجعة وسيتم الرد عليك قريباً."
+    elif img_type in ["unclear", "other"]:
+        return "عذراً، لم أتمكن من التعرف على أي منتج في الصورة. الرجاء التأكد من تصوير علبة المنتج بوضوح أو كتابة اسمه."
+        
+    if ai_data.get("requires_admin_review"):
+        await notify_admin(f"مراجعة مطلوبة لمنتج من الرقم:\n{phone}")
+        return "تم استلام الصورة وسيتم مراجعتها من قبل الصيدلي للرد عليك قريباً."
+
+    conf = float(ai_data.get("confidence", 0.0))
+    if conf < 0.65 or ai_data.get("clarity") == "bad":
+        return matcher.build_unclear_image_reply()
+        
+    # (النقطة 7 و 8) بناء عدة احتمالات للبحث لضمان عدم الفشل
+    brand = str(ai_data.get("brand", "")).strip()
+    name = str(ai_data.get("product_name", "")).strip()
+    p_type = str(ai_data.get("product_type", "")).strip()
+    best_visible = extract_best_visible_name(ai_data.get("visible_text", ""))
+    
+    if not name and not best_visible:
+        return "لم أتمكن من استخراج اسم المنتج بوضوح. الرجاء كتابة اسمه."
+
+    queries_to_try = [
+        f"{brand} {name}".strip(),
+        f"{brand} {name} {p_type}".strip(),
+        f"{brand} {best_visible}".strip(),
+        name
+    ]
+    
+    # تجربة المطابقة التدريجية
+    for q in queries_to_try:
+        if len(q) > 2:
+            status, item = matcher.safe_match(matcher.clean_query(q))
+            if status == "MATCHED":
+                if matcher.is_available(item.get("available", "متوفر")):
+                    database.update_user_state(phone, {"last_product": item})
+                else:
+                    database.clear_user_state(phone)
+                return matcher.build_product_reply(item)
+                
+    # إذا فشلت كل المطابقات، نعطيه الرد الخاص بـ (غير متوفر مع بدائل) بناءً على أول استعلام
+    return matcher.build_unavailable_reply(queries_to_try[0], None, phone)
+
 async def process_message(payload: dict):
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
@@ -172,78 +260,58 @@ async def process_message(payload: dict):
                 msg_type = msg.get("type")
                 if not phone or not msg_id: continue
                 
-                # (النقطة 23) منع التكرار 
-                if database.is_message_processed(msg_id):
-                    print(f"Duplicate message ignored: {msg_id}")
+                # منع التكرار المسبق
+                if not database.start_processing_message(msg_id):
                     continue
                 
                 print(f"\n--- LOG START ---\nMESSAGE_ID: {msg_id}\nSOURCE: WhatsApp")
-                user_state = database.get_user_state(phone)
-                final_reply = ""
                 
-                try:
-                    if msg_type == "text":
-                        text = msg.get("text", {}).get("body", "")
-                        print(f"RAW_QUERY: {text}")
-                        q_norm = matcher.normalize_text(text)
-                        print(f"NORMALIZED_QUERY: {q_norm}")
-                        
-                        final_reply = matcher.handle_text_query(phone, text, user_state)
-                        
-                    elif msg_type == "image":
-                        image_id = msg.get("image", {}).get("id", "")
-                        print("RAW_QUERY: [IMAGE]")
-                        await send_whatsapp_message(phone, "جاري فحص الصورة، انتظر لحظات...")
-                        
-                        async def handle_image():
-                            b64 = await download_whatsapp_media(image_id)
-                            if not b64: return "فشل تحميل الصورة من الواتساب. الرجاء كتابة اسم المنتج."
-                            
-                            ai_data = await analyze_image_with_ai(b64)
-                            if not ai_data: return "حدث خطأ أثناء فحص الصورة بالذكاء الاصطناعي. الرجاء كتابة الاسم."
-                            
-                            # (النقطة 30) التعامل مع الروشتة
-                            if ai_data.get("image_type") == "prescription":
-                                await notify_admin(f"روشتة جديدة من الرقم: {phone}")
-                                return "الصورة تبدو كوصفة طبية (روشتة). تم تحويلها للصيدلي للمراجعة وسيتم الرد عليك قريباً."
-                            
-                            # (النقطة 18) فحص الثقة
-                            conf = float(ai_data.get("confidence", 0.0))
-                            if conf < 0.65 or ai_data.get("clarity") == "bad":
-                                return matcher.build_unclear_image_reply()
-                                
-                            # (النقطة 20) بناء استعلام داخلي شامل
-                            p_name = ai_data.get("product_name") or ai_data.get("visible_text", "")
-                            parts = [ai_data.get("brand", ""), p_name, ai_data.get("product_type", ""), ai_data.get("target_area", ""), ai_data.get("size", "")]
-                            internal_query = " ".join([p for p in parts if p]).strip()
-                            print(f"INTERNAL_IMAGE_QUERY: {internal_query}")
-                            
-                            if not internal_query or len(internal_query) < 3: 
-                                return "لم أتمكن من استخراج اسم واضح للمنتج. الرجاء كتابة اسمه."
-                                
-                            return matcher.handle_text_query(phone, internal_query, user_state)
-                            
-                        # Total Image Timeout (25s)
-                        final_reply = await asyncio.wait_for(handle_image(), timeout=25.0)
-                    else:
-                        final_reply = "عذراً، أنا أدعم الرسائل النصية والصور فقط."
-                        
-                except asyncio.TimeoutError:
-                    print("TIMEOUT_FALLBACK")
-                    final_reply = "عذراً، استغرق البحث وقتاً أطول من المتوقع. الرجاء المحاولة مرة أخرى لاحقاً."
-                except Exception as e:
-                    print(f"ERROR_FALLBACK: {e}")
-                    final_reply = "حدث خطأ غير متوقع. الرجاء المحاولة لاحقاً."
-
-                # إرسال الرد النهائي وإشعار الأدمن إذا كان هناك حجز
-                print("FINAL_DECISION: Ready to send reply")
-                await send_whatsapp_message(phone, final_reply)
-                
-                # إشعار الأدمن عند تسجيل حجز جديد
-                if "تم تسجيل طلب الحجز" in final_reply:
-                    await notify_admin(f"حجز جديد من الرقم: {phone}")
+                # استخدام القفل لضمان الترتيب للزبون الواحد
+                lock = get_user_lock(phone)
+                async with lock:
+                    user_state = database.get_user_state(phone)
+                    final_reply = ""
                     
-                print("--- LOG END ---\n")
+                    try:
+                        if msg_type == "text":
+                            text = msg.get("text", {}).get("body", "")
+                            print(f"RAW_QUERY: {text}\nNORMALIZED: {matcher.normalize_text(text)}")
+                            final_reply = matcher.handle_text_query(phone, text, user_state)
+                            
+                        elif msg_type == "image":
+                            image_id = msg.get("image", {}).get("id", "")
+                            print("RAW_QUERY: [IMAGE]")
+                            await send_whatsapp_message(phone, "جاري فحص الصورة، انتظر لحظات...")
+                            
+                            # Timeout للصورة كاملة 25 ثانية
+                            final_reply = await asyncio.wait_for(handle_image_logic(phone, image_id, user_state), timeout=25.0)
+                        else:
+                            final_reply = "عذراً، أنا أدعم الرسائل النصية والصور فقط."
+                            
+                    except asyncio.TimeoutError:
+                        print("TIMEOUT_FALLBACK")
+                        final_reply = "عذراً، استغرق البحث وقتاً أطول من المتوقع. الرجاء المحاولة مرة أخرى لاحقاً."
+                    except Exception as e:
+                        print(f"ERROR_FALLBACK: {e}")
+                        final_reply = "حدث خطأ غير متوقع. الرجاء المحاولة لاحقاً."
+
+                    # إرسال الرد النهائي وإغلاق الرسالة لمنع التكرار نهائياً
+                    print("FINAL_DECISION: Ready to send reply")
+                    send_status = await send_whatsapp_message(phone, final_reply)
+                    database.mark_message_done(msg_id, "done" if send_status else "failed")
+                    
+                    # (النقطة 20) إشعار الأدمن التفصيلي بالحجز
+                    if "تم تسجيل طلب الحجز" in final_reply:
+                        item = database.get_user_state(phone).get("last_product", {})
+                        if not item: # حجز بديل
+                            orders = database.get_all_orders()
+                            if orders: item = {"name": orders[0]["product_name"], "price": orders[0]["price"]}
+                        
+                        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        notify_msg = f"🛒 حجز جديد:\n📞 الرقم: {phone}\n📦 المنتج: {item.get('name', 'غير محدد')}\n💰 السعر: {item.get('price', '')}\n⏰ الوقت: {time_str}"
+                        await notify_admin(notify_msg)
+                        
+                    print("--- LOG END ---\n")
 
 async def webhook_worker():
     while True:
@@ -254,7 +322,16 @@ async def webhook_worker():
 
 @app.on_event("startup")
 async def startup_event():
-    print(f"Starting PriceBot Pro... META_TOKEN masked: {mask_token(META_TOKEN)}")
+    print("========================================")
+    print(f"🚀 STARTING PriceBot Pro (VERSION: clean-v1)")
+    print(f"📦 Products Count: {len(database.load_products())}")
+    print(f"🧠 AI Model: {AI_MODEL}")
+    print(f"🔑 AI Key: {mask_token(AI_KEYS)}")
+    print(f"📱 Phone ID: {PHONE_ID}")
+    print(f"🛡️ Admin Key Set: {'YES' if os.getenv('ADMIN_KEY') else 'NO (Using Default)'}")
+    print(f"🗄️ Database Path: {database.DB_FILE}")
+    print(f"⚙️ Workers: 5")
+    print("========================================")
     for _ in range(5): asyncio.create_task(webhook_worker())
 
 @app.on_event("shutdown")
