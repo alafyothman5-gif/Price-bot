@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 # ==========================================
-# (النقطة 3) قاعدة البيانات ثابتة بجانب ملفات المشروع لتجنب إنشاء قاعدة فارغة
+# قاعدة البيانات في مسار آمن وثابت
 # ==========================================
 BASE_DIR = Path(__file__).resolve().parent
 DB_FILE = BASE_DIR / "pricebot.db"
@@ -21,9 +21,9 @@ def get_db_connection() -> sqlite3.Connection:
     return conn
 
 def init_db():
-    """تهيئة القاعدة وعمل Migration آمن للبيانات القديمة (النقطة 4)"""
+    """تهيئة الجداول وعمل Migration للبيانات القديمة"""
     with get_db_connection() as conn:
-        # 1. جدول المنتجات الأساسي
+        # 1. جدول المنتجات
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +31,7 @@ def init_db():
             )
         """)
         
-        # --- Migration: التأكد من وجود كل الأعمدة في جدول products ---
+        # Migration الآمن لكل الأعمدة التي طلبها المشرف
         cursor = conn.execute("PRAGMA table_info(products)")
         existing_columns = [col["name"] for col in cursor.fetchall()]
         
@@ -46,7 +46,8 @@ def init_db():
             "price": "TEXT DEFAULT ''",
             "available": "TEXT DEFAULT 'متوفر'",
             "notes": "TEXT DEFAULT ''",
-            "image": "TEXT DEFAULT ''"
+            "image": "TEXT DEFAULT ''",
+            "normalized_name": "TEXT DEFAULT ''" # جديد لضمان دقة الرفع وعدم التكرار (النقطة 22)
         }
         
         for col, dtype in required_columns.items():
@@ -54,26 +55,28 @@ def init_db():
                 conn.execute(f"ALTER TABLE products ADD COLUMN {col} {dtype}")
                 print(f"Migration: Added column '{col}' to products table.")
 
-        # 2. (النقطة 14) جدول الطلبات الفعلي
+        # 2. جدول الطلبات
         conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 phone TEXT,
                 product_name TEXT,
+                price TEXT,
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
-        # 3. (النقطة 23) جدول منع تكرار الرسائل (Duplicate Protection)
+        # 3. (النقطة 3) جدول منع التكرار المحدث
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_messages (
                 message_id TEXT PRIMARY KEY,
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                status TEXT DEFAULT 'processing',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
-        # 4. جدول حالة الزبون لدعم الحجز واختيار بدائل بالأرقام
+        # 4. جدول حالة الزبون
         conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_state (
                 phone TEXT PRIMARY KEY,
@@ -81,29 +84,38 @@ def init_db():
                 updated_at INTEGER NOT NULL
             )
         """)
-        
         conn.commit()
 
 # ==========================================
-# وظائف الرسائل لمنع التكرار (النقطة 23)
+# (النقطة 3) نظام الحماية من تكرار الرسائل (المعدل)
 # ==========================================
-def is_message_processed(message_id: str) -> bool:
+def start_processing_message(message_id: str) -> bool:
+    """إرجاع True إذا كانت الرسالة جديدة وتم تسجيلها للبدء. إرجاع False إذا تمت معالجتها أو جاري معالجتها."""
     if not message_id: return False
     with get_db_connection() as conn:
-        row = conn.execute("SELECT message_id FROM processed_messages WHERE message_id=?", (message_id,)).fetchone()
-        if row: return True
-        
-        # تسجيل الرسالة كمعالجة
-        conn.execute("INSERT INTO processed_messages (message_id) VALUES (?)", (message_id,))
+        row = conn.execute("SELECT status FROM processed_messages WHERE message_id=?", (message_id,)).fetchone()
+        if row:
+            # إذا كانت status = done، نتجاهلها. إذا failed، ممكن نسمح بمعالجتها مرة أخرى لاحقاً لو طلبنا.
+            # حالياً نمنع التكرار طالما هي مسجلة.
+            return False
+            
+        conn.execute("INSERT INTO processed_messages (message_id, status) VALUES (?, 'processing')", (message_id,))
         conn.commit()
-        return False
+        return True
+
+def mark_message_done(message_id: str, final_status: str = 'done'):
+    """يتم استدعاءها فقط بعد الإرسال النهائي لضمان عدم ضياع الرسالة في حال حدوث Error (النقطة 3)"""
+    if not message_id: return
+    with get_db_connection() as conn:
+        conn.execute("UPDATE processed_messages SET status=?, updated_at=CURRENT_TIMESTAMP WHERE message_id=?", (final_status, message_id))
+        conn.commit()
 
 # ==========================================
-# وظائف الطلبات (النقطة 14)
+# الطلبات وحالة الزبون
 # ==========================================
-def add_order(phone: str, product_name: str):
+def add_order(phone: str, product_name: str, price: str = ""):
     with get_db_connection() as conn:
-        conn.execute("INSERT INTO orders (phone, product_name) VALUES (?, ?)", (phone, product_name))
+        conn.execute("INSERT INTO orders (phone, product_name, price) VALUES (?, ?, ?)", (phone, product_name, price))
         conn.commit()
 
 def get_all_orders() -> List[dict]:
@@ -116,17 +128,12 @@ def update_order_status(order_id: int, status: str):
         conn.execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
         conn.commit()
 
-# ==========================================
-# وظائف الذاكرة (State)
-# ==========================================
 def get_user_state(phone: str) -> dict:
     with get_db_connection() as conn:
         row = conn.execute("SELECT state_json FROM conversation_state WHERE phone=?", (phone,)).fetchone()
         if row:
-            try:
-                return json.loads(row["state_json"])
-            except:
-                return {}
+            try: return json.loads(row["state_json"])
+            except: return {}
         return {}
 
 def update_user_state(phone: str, state_data: dict):
@@ -147,7 +154,7 @@ def clear_user_state(phone: str):
         conn.commit()
 
 # ==========================================
-# إدارة المنتجات والنسخ الاحتياطي 
+# إدارة المنتجات والنسخ الاحتياطي
 # ==========================================
 def load_products() -> List[dict]:
     try:
@@ -159,22 +166,18 @@ def load_products() -> List[dict]:
         return []
 
 def backup_database():
-    """(النقطة 26) النسخ الاحتياطي في مجلد backups وباسم يحتوي على التاريخ والوقت"""
-    if not DB_FILE.exists():
-        return
-        
-    # التأكد من وجود مجلد النسخ الاحتياطي
+    """نسخ احتياطي منظم في مجلد backups"""
+    if not DB_FILE.exists(): return
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
-    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_name = f"pricebot_backup_{timestamp}.db"
     backup_path = BACKUPS_DIR / backup_name
-    
     try:
         shutil.copy(DB_FILE, backup_path)
         print(f"✅ Backup created successfully: {backup_path}")
     except Exception as e:
         print(f"❌ Backup failed: {e}")
 
-# تشغيل التهيئة عند استدعاء الملف للتأكد من سلامة القاعدة
+# التأكد من التهيئة
 init_db()
+
