@@ -3,12 +3,8 @@ import difflib
 from typing import List, Optional, Tuple
 import database
 
-# ==========================================
-# 1. القواميس والمفردات الذكية (محدثة بالكامل)
-# ==========================================
 GREETINGS = ["السلام عليكم", "مرحبا", "hi", "hello", "هلا", "مرحبتين"]
 
-# (النقطة 13) كلمات الطلب مرتبة من الأطول للأقصر لضمان الحذف الصحيح
 STOPWORDS = [
     "متوفر عندكم", "لو سمحت", "هل يوجد", "هل في", "عندكمش",
     "متوفر", "عندكم", "موجود", "بكم", "سعر", "هل", "نبي", "اريد", "في", "فيه", "عندك", "بكام", 
@@ -27,8 +23,9 @@ BRANDS = [
     "uriage", "avene", "theordinary", "سيرافي", "لاروش", "يوسيرين", "سيتافيل", "فيشي", "بيوديرما"
 ]
 
+# (النقطة 6) الترتيب هنا مقصود لضمان أن cleanser يقيم أولاً
 TYPE_WORDS = {
-    "cleanser": ["cleanser", "wash", "foaming", "gel moussant", "غسول", "منظف", "face wash"],
+    "cleanser": ["cleanser", "wash", "foaming", "gel moussant", "غسول", "منظف", "face wash", "moussant"],
     "moisturizer": ["moisturizer", "مرطب", "moisturising", "hydrating", "ترطيب"],
     "lotion": ["lotion", "لوشن"],
     "cream": ["cream", "كريم", "baume"],
@@ -37,25 +34,22 @@ TYPE_WORDS = {
     "shampoo": ["shampoo", "شامبو"]
 }
 
-# سيتم توحيد نصوص هذه القواميس تلقائياً لتجنب مشاكل (ة / ه)
+# (النقطة 6) النسخ המנرمزة מسبقاً
 AREA_WORDS = {
     "face": ["face", "visage", "وجه", "بشرة", "بشره"],
     "body": ["body", "corps", "جسم", "بدن"],
     "baby": ["baby", "enfant", "pediatril", "بيبي", "اطفال", "أطفال", "رضع", "kids"],
     "hair": ["hair", "cheveux", "شعر"],
-    "mouth": ["mouth", "oral", "dental", "teeth", "فم", "اسنان", "أسنان"]
+    "mouth": ["mouth", "oral", "dental", "teeth", "فم", "اسنان", "أسنان", "غسول فم"]
 }
 
 UNAVAILABLE_TERMS = ["غير متوفر", "غير موجود", "نافذ", "نفذ", "ناقص", "لا", "0", "no", "out of stock", "unavailable"]
-
-# كلمات مشتركة لترتيب البدائل (النقطة 17)
 SHARED_TERMS = ["acne", "oily", "dry", "sensitive", "sa", "foaming", "hydrating", "دهنية", "جافة", "حساسة"]
 
-# ==========================================
-# 2. دوال التنظيف والمعالجة
-# ==========================================
+# (النقطة 5) كلمات عامة يمنع أن تفوز بالمطابقة الدقيقة إذا كانت لوحدها
+GENERIC_TERMS = list(BRANDS) + ["cleanser", "wash", "غسول", "مرطب", "moisturizer", "lotion", "لوشن", "cream", "كريم", "serum", "سيروم", "شامبو", "shampoo", "sunscreen", "واقي شمس", "واقي", "ترطيب"]
+
 def normalize_text(text: str) -> str:
-    """(النقطة 6) توحيد الحروف العربية والإنجليزية بشكل صارم"""
     s = str(text or "").strip().lower()
     for src, dst in {"أ": "ا", "إ": "ا", "آ": "ا", "ة": "ه", "ى": "ي", "ط": "ط"}.items():
         s = s.replace(src, dst)
@@ -81,9 +75,11 @@ def extract_features(text: str) -> Tuple[Optional[str], Optional[str], Optional[
     for b in BRANDS:
         if b in text: brand = b; break
     for t, words in TYPE_WORDS.items():
-        if any(normalize_text(w) in text for w in words): p_type = t; break
+        if any(normalize_text(w) in text for w in words):
+            p_type = t; break
     for a, words in AREA_WORDS.items():
-        if any(normalize_text(w) in text for w in words): area = a; break
+        if any(normalize_text(w) in text for w in words):
+            area = a; break
     return brand, p_type, area
 
 def is_available(status_str: str) -> bool:
@@ -91,11 +87,9 @@ def is_available(status_str: str) -> bool:
     return not any(term == s or term in s for term in UNAVAILABLE_TERMS)
 
 def is_cosmetic(p_type: Optional[str]) -> bool:
-    """(النقطة 16) التأكد أن المنتج كوزمتك"""
     return bool(p_type)
 
 def get_product_identity(item: dict) -> str:
-    """(النقطة 5) دمج كل حقول المنتج في هوية واحدة للمطابقة"""
     parts = [
         item.get('name', ''), item.get('brand', ''), item.get('company', ''), 
         item.get('form', ''), item.get('active_ingredient', ''), 
@@ -103,37 +97,33 @@ def get_product_identity(item: dict) -> str:
     ]
     return normalize_text(" ".join([str(p) for p in parts if p]))
 
-# ==========================================
-# 3. محرك المطابقة الصارم
-# ==========================================
 def safe_match(q_clean: str) -> Tuple[str, Optional[dict]]:
     if not q_clean or len(q_clean) < 2: return "FALLBACK", None
 
-    products = database.load_products()
+    q_brand, q_type, q_area = extract_features(q_clean)
     
-    # 1. المطابقة الدقيقة جداً (تفوز دائماً)
+    if not q_brand and not q_type and len(q_clean.split()) == 1 and not any(q_clean in w for words in TYPE_WORDS.values() for w in words):
+        return "FALLBACK", None 
+        
+    if q_brand and not q_type and len(q_clean.split()) <= 2: return "BRAND_ONLY", None
+    if q_type and not q_brand and not q_area and len(q_clean.split()) <= 2: return "CATEGORY_ONLY", None
+
+    products = database.load_products()
+
+    # 1. المطابقة الدقيقة (مع منع الكلمات العامة من النقطة 5)
     for p in products:
         p_name_norm = normalize_text(p.get("name", ""))
         aliases = get_aliases(p.get("aliases", ""))
         if q_clean == p_name_norm or q_clean in aliases:
+            if q_clean in GENERIC_TERMS:
+                continue # نرفضها كمطابقة دقيقة ونتركها للبحث التقريبي
             return "MATCHED", p
 
-    q_brand, q_type, q_area = extract_features(q_clean)
-    
-    # (النقطة 12 و 14) فحص الجودة وتصنيف البحث
-    if not q_brand and not q_type and len(q_clean.split()) == 1:
-        return "FALLBACK", None # كلمات مثل test123 أو خرابيط
-        
-    if q_type and not q_brand and len(q_clean.split()) <= 3:
-        return "CATEGORY_ONLY", None # غسول وجه، face wash
-        
-    if q_brand and not q_type and len(q_clean.split()) <= 2:
-        return "BRAND_ONLY", None # CeraVe
-
-    # 2. المطابقة عبر العبارة الكاملة (مع فلترة البراند)
+    # 2. المطابقة عبر العبارة الكاملة (مع الفلترة الصارمة للنقطة 4)
     for p in products:
         p_id = get_product_identity(p)
         if q_clean in p_id:
+            if q_brand and q_brand not in p_id: continue # النقطة 4
             p_brand, p_type, p_area = extract_features(p_id)
             if q_brand and p_brand and q_brand != p_brand: continue
             if q_type and p_type and q_type != p_type: continue
@@ -143,8 +133,9 @@ def safe_match(q_clean: str) -> Tuple[str, Optional[dict]]:
     candidates = []
     for p in products:
         p_id = get_product_identity(p)
+        if q_brand and q_brand not in p_id: continue # النقطة 4
+        
         p_brand, p_type, p_area = extract_features(p_id)
-
         if q_brand and p_brand and q_brand != p_brand: continue
         if q_type and p_type and q_type != p_type: continue
         if q_area and p_area and q_area != p_area: continue
@@ -160,19 +151,22 @@ def safe_match(q_clean: str) -> Tuple[str, Optional[dict]]:
     if best_match: return "MATCHED", best_match
     return "UNAVAILABLE", None
 
-# ==========================================
-# 4. توليد البدائل (النقطة 7 و 15 و 17)
-# ==========================================
-def get_cosmetic_alternatives(target_product: dict, query_clean: str, limit: int = 3) -> List[dict]:
+# (النقطة 3 و 7) تمرير target_area الصريح والصرامة التامة لبدائل الوجه
+def get_cosmetic_alternatives(target_product: dict, query_clean: str, limit: int = 3, explicit_area: str = None) -> List[dict]:
     target_id = get_product_identity(target_product) if target_product else query_clean
     t_brand, t_type, t_area = extract_features(target_id)
-
+    
+    if explicit_area: t_area = explicit_area
     if not is_cosmetic(t_type): return []
+
+    # (النقطة 7) افتراض أن غسولات الماركات الكوزمتك هي للوجه ما لم يذكر غير ذلك
+    if t_type == "cleanser" and not t_area and t_brand in BRANDS:
+        if not any(w in query_clean for w in AREA_WORDS["body"] + AREA_WORDS["hair"] + AREA_WORDS["baby"] + AREA_WORDS["mouth"]):
+            t_area = "face"
 
     products = database.load_products()
     valid_alts = []
     
-    # القائمة السوداء لغسولات الوجه (النقطة 7)
     face_blacklist = [normalize_text(w) for w in AREA_WORDS["body"] + AREA_WORDS["baby"] + AREA_WORDS["hair"] + AREA_WORDS["mouth"] + ["shampoo", "شامبو", "mouth wash", "body wash", "baby wash"]]
     
     for p in products:
@@ -183,14 +177,13 @@ def get_cosmetic_alternatives(target_product: dict, query_clean: str, limit: int
         p_brand, p_type, p_area = extract_features(p_id)
 
         if p_type == t_type:
-            # (النقطة 7 و 15) فلترة المنطقة الصارمة جداً
+            # فلترة المناطق الصارمة
             if t_area == "face":
                 if any(bw in p_id for bw in face_blacklist):
                     continue
             elif t_area and p_area and t_area != p_area: 
                 continue
                 
-            # (النقطة 17) حساب نسبة الترشيح (Ranking)
             score = 0
             if t_brand and p_brand == t_brand: score += 50
             if t_area and p_area == t_area: score += 30
@@ -204,25 +197,20 @@ def get_cosmetic_alternatives(target_product: dict, query_clean: str, limit: int
     valid_alts.sort(key=lambda x: x[0], reverse=True)
     return [alt[1] for alt in valid_alts[:limit]]
 
-# ==========================================
-# 5. بناء الردود وادارة الحجوزات
-# ==========================================
 def handle_text_query(phone: str, text: str, user_state: dict) -> str:
     q_norm = normalize_text(text)
     q_clean = clean_query(text)
 
-    # الترحيب
     if q_norm in GREETINGS or q_clean in GREETINGS:
         return "مرحباً بك في صيدلية بدر البشرية 🌿\nأرسل اسم المنتج أو صورته للبحث عن السعر والتوفر."
 
-    # (النقطة 14 من رسائل المشرف) الحماية الإضافية للحجز
+    # (النقطة 14 و 18 و 19) الحماية الإضافية للحجز والتأكد من التوفر قبل الإضافة
     if q_norm in ["نعم", "اي", "حجز", "yes"]:
         if "last_product" in user_state:
             item = user_state["last_product"]
             if not is_available(item.get("available", "متوفر")):
                 database.clear_user_state(phone)
                 return "عذراً، المنتج المطلوب غير متوفر حالياً للحجز."
-                
             database.add_order(phone, item.get('name'), item.get('price', ''))
             database.clear_user_state(phone)
             return f"🌿 صيدلية بدر البشرية\n\n✅ تم تسجيل طلب الحجز للمنتج:\n{item.get('name')}\nسيتم التواصل معك قريباً للتأكيد."
@@ -232,7 +220,6 @@ def handle_text_query(phone: str, text: str, user_state: dict) -> str:
         database.clear_user_state(phone)
         return "🌿 صيدلية بدر البشرية\n\nتم الإلغاء. يمكنك البحث عن منتج آخر."
 
-    # اختيار البديل بالرقم
     if q_norm.isdigit() and "pending_alternatives" in user_state:
         idx = int(q_norm) - 1
         alts = user_state["pending_alternatives"]
@@ -243,7 +230,6 @@ def handle_text_query(phone: str, text: str, user_state: dict) -> str:
                 database.update_user_state(phone, {"last_product": selected_item})
             return build_product_reply(selected_item)
 
-    # المطابقة
     status, item = safe_match(q_clean)
 
     if status == "FALLBACK":
@@ -276,8 +262,8 @@ def build_product_reply(item: dict) -> str:
         
     return reply
 
-def build_unavailable_reply(q_clean: str, target_product: Optional[dict], phone: str) -> str:
-    alts = get_cosmetic_alternatives(target_product, q_clean)
+def build_unavailable_reply(q_clean: str, target_product: Optional[dict], phone: str, explicit_area: str = None) -> str:
+    alts = get_cosmetic_alternatives(target_product, q_clean, explicit_area=explicit_area)
     reply = "🌿 صيدلية بدر البشرية\n\nالمنتج المطلوب غير متوفر حالياً في قائمة الصيدلية."
 
     if alts:
