@@ -32,16 +32,29 @@ def init_db():
             if col not in existing_columns:
                 conn.execute(f"ALTER TABLE products ADD COLUMN {col} {dtype}")
 
+        # --- الـ Migration الآمن لجدول الطلبات ---
         conn.execute("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT)")
         cursor_orders = conn.execute("PRAGMA table_info(orders)")
         existing_order_cols = [col["name"] for col in cursor_orders.fetchall()]
-        order_cols_needed = {"product_name": "TEXT", "price": "TEXT", "status": "TEXT DEFAULT 'pending'", "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"}
-        for col, dtype in order_cols_needed.items():
-            if col not in existing_order_cols:
-                conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {dtype}")
-        if "product" in existing_order_cols and "product_name" not in existing_order_cols:
-            try: conn.execute("UPDATE orders SET product_name = product WHERE product_name IS NULL")
-            except: pass
+        
+        if "product_name" not in existing_order_cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN product_name TEXT DEFAULT ''")
+            if "product" in existing_order_cols:
+                try: conn.execute("UPDATE orders SET product_name = product WHERE product_name IS NULL OR product_name = ''")
+                except Exception as e: print(f"Orders Migration Error (product_name): {e}")
+
+        if "price" not in existing_order_cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN price TEXT DEFAULT ''")
+
+        if "status" not in existing_order_cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN status TEXT DEFAULT 'pending'")
+
+        if "created_at" not in existing_order_cols:
+            # إضافة العمود كـ TEXT فارغ أولاً لتجنب OperationalError في SQLite
+            conn.execute("ALTER TABLE orders ADD COLUMN created_at TEXT DEFAULT ''")
+            # تحديث الأسطر القديمة بالوقت الحالي
+            try: conn.execute("UPDATE orders SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL OR created_at = ''")
+            except Exception as e: print(f"Orders Migration Error (created_at): {e}")
 
         conn.execute("CREATE TABLE IF NOT EXISTS processed_messages (message_id TEXT PRIMARY KEY, status TEXT DEFAULT 'processing', updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         conn.execute("CREATE TABLE IF NOT EXISTS conversation_state (phone TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_at INTEGER NOT NULL)")
@@ -77,7 +90,8 @@ def mark_message_done(message_id: str, final_status: str = 'done'):
 
 def add_order(phone: str, product_name: str, price: str = ""):
     with get_db_connection() as conn:
-        conn.execute("INSERT INTO orders (phone, product_name, price) VALUES (?, ?, ?)", (phone, product_name, price))
+        # إدخال created_at صراحة لتجنب الاعتماد على الـ default
+        conn.execute("INSERT INTO orders (phone, product_name, price, status, created_at) VALUES (?, ?, ?, 'pending', CURRENT_TIMESTAMP)", (phone, product_name, price))
         conn.commit()
 
 def get_all_orders() -> List[dict]:
