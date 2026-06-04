@@ -23,7 +23,6 @@ BRANDS = [
     "uriage", "avene", "theordinary", "سيرافي", "لاروش", "يوسيرين", "سيتافيل", "فيشي", "بيوديرما"
 ]
 
-# (النقطة 6) الترتيب هنا مقصود لضمان أن cleanser يقيم أولاً
 TYPE_WORDS = {
     "cleanser": ["cleanser", "wash", "foaming", "gel moussant", "غسول", "منظف", "face wash", "moussant"],
     "moisturizer": ["moisturizer", "مرطب", "moisturising", "hydrating", "ترطيب"],
@@ -34,7 +33,6 @@ TYPE_WORDS = {
     "shampoo": ["shampoo", "شامبو"]
 }
 
-# (النقطة 6) النسخ המנرمزة מسبقاً
 AREA_WORDS = {
     "face": ["face", "visage", "وجه", "بشرة", "بشره"],
     "body": ["body", "corps", "جسم", "بدن"],
@@ -46,7 +44,6 @@ AREA_WORDS = {
 UNAVAILABLE_TERMS = ["غير متوفر", "غير موجود", "نافذ", "نفذ", "ناقص", "لا", "0", "no", "out of stock", "unavailable"]
 SHARED_TERMS = ["acne", "oily", "dry", "sensitive", "sa", "foaming", "hydrating", "دهنية", "جافة", "حساسة"]
 
-# (النقطة 5) كلمات عامة يمنع أن تفوز بالمطابقة الدقيقة إذا كانت لوحدها
 GENERIC_TERMS = list(BRANDS) + ["cleanser", "wash", "غسول", "مرطب", "moisturizer", "lotion", "لوشن", "cream", "كريم", "serum", "سيروم", "شامبو", "shampoo", "sunscreen", "واقي شمس", "واقي", "ترطيب"]
 
 def normalize_text(text: str) -> str:
@@ -106,34 +103,33 @@ def safe_match(q_clean: str) -> Tuple[str, Optional[dict]]:
         return "FALLBACK", None 
         
     if q_brand and not q_type and len(q_clean.split()) <= 2: return "BRAND_ONLY", None
-    if q_type and not q_brand and not q_area and len(q_clean.split()) <= 2: return "CATEGORY_ONLY", None
+    
+    # التعديل لضمان أن (غسول وجه) وما يشابهها يتم إيقافها قبل المطابقة العشوائية
+    if q_type and not q_brand and len(q_clean.split()) <= 3: return "CATEGORY_ONLY", None
 
     products = database.load_products()
 
-    # 1. المطابقة الدقيقة (مع منع الكلمات العامة من النقطة 5)
     for p in products:
         p_name_norm = normalize_text(p.get("name", ""))
         aliases = get_aliases(p.get("aliases", ""))
         if q_clean == p_name_norm or q_clean in aliases:
             if q_clean in GENERIC_TERMS:
-                continue # نرفضها كمطابقة دقيقة ونتركها للبحث التقريبي
+                continue 
             return "MATCHED", p
 
-    # 2. المطابقة عبر العبارة الكاملة (مع الفلترة الصارمة للنقطة 4)
     for p in products:
         p_id = get_product_identity(p)
         if q_clean in p_id:
-            if q_brand and q_brand not in p_id: continue # النقطة 4
+            if q_brand and q_brand not in p_id: continue 
             p_brand, p_type, p_area = extract_features(p_id)
             if q_brand and p_brand and q_brand != p_brand: continue
             if q_type and p_type and q_type != p_type: continue
             return "MATCHED", p
 
-    # 3. المطابقة التقريبية الآمنة
     candidates = []
     for p in products:
         p_id = get_product_identity(p)
-        if q_brand and q_brand not in p_id: continue # النقطة 4
+        if q_brand and q_brand not in p_id: continue 
         
         p_brand, p_type, p_area = extract_features(p_id)
         if q_brand and p_brand and q_brand != p_brand: continue
@@ -151,7 +147,6 @@ def safe_match(q_clean: str) -> Tuple[str, Optional[dict]]:
     if best_match: return "MATCHED", best_match
     return "UNAVAILABLE", None
 
-# (النقطة 3 و 7) تمرير target_area الصريح والصرامة التامة لبدائل الوجه
 def get_cosmetic_alternatives(target_product: dict, query_clean: str, limit: int = 3, explicit_area: str = None) -> List[dict]:
     target_id = get_product_identity(target_product) if target_product else query_clean
     t_brand, t_type, t_area = extract_features(target_id)
@@ -159,7 +154,6 @@ def get_cosmetic_alternatives(target_product: dict, query_clean: str, limit: int
     if explicit_area: t_area = explicit_area
     if not is_cosmetic(t_type): return []
 
-    # (النقطة 7) افتراض أن غسولات الماركات الكوزمتك هي للوجه ما لم يذكر غير ذلك
     if t_type == "cleanser" and not t_area and t_brand in BRANDS:
         if not any(w in query_clean for w in AREA_WORDS["body"] + AREA_WORDS["hair"] + AREA_WORDS["baby"] + AREA_WORDS["mouth"]):
             t_area = "face"
@@ -177,7 +171,6 @@ def get_cosmetic_alternatives(target_product: dict, query_clean: str, limit: int
         p_brand, p_type, p_area = extract_features(p_id)
 
         if p_type == t_type:
-            # فلترة المناطق الصارمة
             if t_area == "face":
                 if any(bw in p_id for bw in face_blacklist):
                     continue
@@ -204,7 +197,6 @@ def handle_text_query(phone: str, text: str, user_state: dict) -> str:
     if q_norm in GREETINGS or q_clean in GREETINGS:
         return "مرحباً بك في صيدلية بدر البشرية 🌿\nأرسل اسم المنتج أو صورته للبحث عن السعر والتوفر."
 
-    # (النقطة 14 و 18 و 19) الحماية الإضافية للحجز والتأكد من التوفر قبل الإضافة
     if q_norm in ["نعم", "اي", "حجز", "yes"]:
         if "last_product" in user_state:
             item = user_state["last_product"]
