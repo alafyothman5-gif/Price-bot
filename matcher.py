@@ -1,175 +1,153 @@
 import re
-import json
 import difflib
 from typing import List, Optional, Tuple
 import database
 
 # ==========================================
-# 1. القواميس الذكية (Smart Dictionaries)
+# القواميس الذكية للفلترة (النقطة 13)
 # ==========================================
 SYNONYMS = {
     "cera ve": "cerave", "moisturising": "moisturizing", "moisturiser": "moisturizer",
     "سيرافي": "cerave", "غسول": "cleanser", "منظف": "cleanser", "مرطب": "moisturizer",
-    "لوشن": "lotion", "كريم": "cream", "سيروم": "serum", "لاروش": "la roche",
-    "واقي شمس": "sunscreen", "شامبو": "shampoo", "بنادول": "panadol", "بروفين": "brufen"
+    "لوشن": "lotion", "كريم": "cream", "سيروم": "serum", "لاروش": "laroche",
+    "la roche": "laroche", "la roche posay": "laroche",
+    "واقي شمس": "sunscreen", "شامبو": "shampoo"
 }
 
 TYPE_WORDS = {
-    "cleanser": ["cleanser", "wash", "foaming", "gel moussant", "غسول", "منظف"],
-    "moisturizer": ["moisturizer", "مرطب"], "lotion": ["lotion", "لوشن"],
-    "cream": ["cream", "كريم"], "serum": ["serum", "سيروم"],
-    "sunscreen": ["sunscreen", "spf", "واقي شمس"], "shampoo": ["shampoo", "شامبو"],
-    "tablets": ["tablet", "tab", "اقراص", "حبوب"], "syrup": ["syrup", "شراب"],
+    "cleanser": ["cleanser", "wash", "foaming", "gel moussant", "غسول", "منظف", "face wash"],
+    "moisturizer": ["moisturizer", "مرطب", "moisturising"],
+    "lotion": ["lotion", "لوشن"],
+    "cream": ["cream", "كريم", "baume"],
+    "serum": ["serum", "سيروم"],
+    "sunscreen": ["sunscreen", "spf", "واقي شمس", "sunblock"],
+    "shampoo": ["shampoo", "شامبو"]
 }
 
-# ==========================================
-# 2. معالجة وتوحيد النصوص (Normalization)
-# ==========================================
+# قوائم لمنع البحث بكلمة واحدة عامة
+BRANDS = ["cerave", "laroche", "cetaphil", "vichy", "eucerin", "bioderma", "سيرافي", "لاروش", "سيتافيل", "فيشي", "يوسيرين"]
+CATEGORIES = ["cleanser", "moisturizer", "lotion", "cream", "serum", "sunscreen", "shampoo", "غسول", "مرطب", "لوشن", "كريم", "سيروم", "واقي", "شامبو"]
+
 def normalize_text(text: str) -> str:
     s = str(text or "").strip().lower()
-    for src, dst in {"أ": "ا", "إ": "ا", "آ": "ا", "ة": "ه", "ى": "ي"}.items():
+    for src, dst in {"أ": "ا", "إ": "ا", "آ": "ا", "ة": "ه", "ى": "ي", "ط": "ط"}.items():
         s = s.replace(src, dst)
-    s = re.sub(r"[^\w\s\u0600-\u06FF]+", " ", s) # إزالة الرموز مع الاحتفاظ بالعربي والإنجليزي
-    
-    # تطبيق المرادفات الذكية
+    s = re.sub(r"[^\w\s\u0600-\u06FF]+", " ", s)
     for src, dst in sorted(SYNONYMS.items(), key=lambda x: len(x[0]), reverse=True):
         s = re.sub(rf"(?<!\w){re.escape(src)}(?!\w)", dst, s)
-        
     return re.sub(r"\s+", " ", s).strip()
 
-def extract_code_tokens(text: str) -> List[str]:
-    """استخراج الأكواد والأرقام بدقة (مثل 123syp أو 500mg) من ترقيعة V1"""
-    q = normalize_text(text)
-    raw = re.findall(r"[a-zA-Z]*\d+[a-zA-Z]*", q)
-    tokens = []
-    for t in raw:
-        if len(re.sub(r"\D+", "", t)) <= 8: # تجاهل أرقام الهواتف
-            tokens.append(t)
-    return tokens
-
-# ==========================================
-# 3. محرك المطابقة الآمن (Safe Matcher V5)
-# ==========================================
-def product_identity_text(item: dict) -> str:
-    """تجميع بيانات المنتج في نص واحد للبحث"""
-    return " ".join([
-        str(item.get("name", "")), str(item.get("aliases", "")),
-        str(item.get("company", "")), str(item.get("form", "")),
-        str(item.get("strength", ""))
-    ]).lower()
-
-def exact_safe_product_match(query: str) -> Optional[dict]:
-    """البحث الدقيق والآمن جداً لمنع عرض أدوية خاطئة"""
-    q_norm = normalize_text(query)
-    if not q_norm or len(q_norm) < 2:
-        return None
-        
-    products = database.load_products()
-    code_tokens = extract_code_tokens(query)
-    
-    # 1. مطابقة الاسم الدقيق أولاً
-    for item in products:
-        if q_norm == normalize_text(item.get("name", "")):
-            return item
-
-    # 2. فلترة صارمة بالأكواد والأرقام (إذا الزبون كتب تركيز أو كود، لا نعرض منتجاً لا يحتويه)
-    if code_tokens:
-        products = [p for p in products if any(t in normalize_text(product_identity_text(p)) for t in code_tokens)]
-
-    # 3. مطابقة الأسماء البديلة (Aliases)
-    for item in products:
-        aliases = [normalize_text(a) for a in str(item.get("aliases", "")).split(",") if a.strip()]
-        if q_norm in aliases:
-            return item
-            
-    # 4. البحث التقريبي (Fuzzy Search) للكلمات الطويلة
-    if len(q_norm) >= 4:
-        best_score = 0.0
-        best_match = None
-        for item in products:
-            target = normalize_text(product_identity_text(item))
-            score = difflib.SequenceMatcher(None, q_norm, target).ratio()
-            if q_norm in target:
-                score += 0.2 # رفع أولوية التطابق الجزئي
-            if score > best_score and score >= 0.75:
-                best_score = score
-                best_match = item
-        return best_match
-
+def detect_type(norm_text: str) -> Optional[str]:
+    for t_key, words in TYPE_WORDS.items():
+        if any(w in norm_text.split() for w in words):
+            return t_key
     return None
 
-def get_cosmetic_alternatives(query: str, limit: int = 5) -> List[dict]:
-    """استخراج البدائل التجميلية بذكاء بناءً على النوع (غسول، لوشن، سيروم)"""
+def get_product_identity(item: dict) -> str:
+    return normalize_text(f"{item.get('name', '')} {item.get('aliases', '')} {item.get('brand', '')} {item.get('form', '')}")
+
+# ==========================================
+# محرك البحث الجبار المطابق للشروط
+# ==========================================
+def safe_match(query: str) -> Tuple[str, Optional[dict]]:
+    """يرجع حالة البحث: MATCHED, BRAND_ONLY, CATEGORY_ONLY, NOT_FOUND"""
     q_norm = normalize_text(query)
-    detected_types = [typ for typ, words in TYPE_WORDS.items() if any(w in q_norm for w in words)]
-    
-    if not detected_types:
-        return []
+    if not q_norm:
+        return "NOT_FOUND", None
+        
+    # منع CeraVe فقط أو cleanser فقط
+    if any(q_norm == b for b in BRANDS): return "BRAND_ONLY", None
+    if any(q_norm == c for c in CATEGORIES): return "CATEGORY_ONLY", None
 
     products = database.load_products()
-    alternatives = []
+    q_type = detect_type(q_norm)
     
-    for item in products:
-        item_text = normalize_text(product_identity_text(item))
-        # التحقق من أن المنتج البديل من نفس النوع التجميلي وأنه متوفر
-        if any(t_word in item_text for t_word in TYPE_WORDS[detected_types[0]]):
-            if item.get("available", "متوفر") != "غير متوفر":
-                alternatives.append(item)
-                if len(alternatives) >= limit:
-                    break
-                    
-    return alternatives
+    # 1. المطابقة الدقيقة جداً (الاسم أو الاسم البديل)
+    for p in products:
+        p_name = normalize_text(p.get("name", ""))
+        aliases = [normalize_text(a) for a in str(p.get("aliases", "")).split(",") if a.strip()]
+        if q_norm == p_name or q_norm in aliases:
+            return "MATCHED", p
+            
+    # 2. المطابقة التقريبية الآمنة (منع تداخل غسول مع لوشن)
+    best_match, best_score = None, 0
+    for p in products:
+        p_id = get_product_identity(p)
+        if q_norm in p_id:
+            p_type = detect_type(p_id)
+            if q_type and p_type and q_type != p_type: continue # منع التداخل (Conflict)
+            return "MATCHED", p
+            
+        score = difflib.SequenceMatcher(None, q_norm, p_id).ratio()
+        if score > 0.85: # نسبة دقة عالية لتجنب الأخطاء
+            p_type = detect_type(p_id)
+            if q_type and p_type and q_type != p_type: continue
+            if score > best_score:
+                best_score = score
+                best_match = p
+                
+    if best_match: return "MATCHED", best_match
+    return "NOT_FOUND", None
 
 # ==========================================
-# 4. مدير الردود (Reply Builder)
+# استخراج البدائل (النقطة 14)
+# ==========================================
+def get_cosmetic_alternatives(query: str, limit: int = 3) -> List[dict]:
+    q_norm = normalize_text(query)
+    target_type = detect_type(q_norm)
+    if not target_type: return []
+        
+    products = database.load_products()
+    alts = []
+    for p in products:
+        if str(p.get("available", "متوفر")).strip() == "غير متوفر": continue
+        if detect_type(get_product_identity(p)) == target_type:
+            alts.append(p)
+            if len(alts) >= limit: break
+    return alts
+
+# ==========================================
+# مدير الردود (النقطة 17)
 # ==========================================
 def build_product_reply(item: dict) -> str:
-    name = item.get("name", "")
-    price = item.get("price", "")
-    available = item.get("available", "متوفر")
-    
-    lines = [
-        "🌿 صيدلية بدر البشرية", "",
-        f"✅ المنتج: {name}",
-        f"📦 الحالة: {available}"
-    ]
-    if price:
-        lines.append(f"💰 السعر: {price} د.ل" if "د" not in price else f"💰 السعر: {price}")
-    lines.extend(["", "للحجز اكتب: نعم"])
-    return "\n".join(lines)
+    name, price, available = item.get("name", ""), item.get("price", ""), item.get("available", "متوفر")
+    price_str = f"{price} د.ل" if price and "د" not in str(price) else str(price)
+    return f"🌿 صيدلية بدر البشرية\n\n✅ المنتج: {name}\n📦 الحالة: {available}\n💰 السعر: {price_str}\n\nللحجز اكتب: نعم"
 
 def build_unavailable_reply(query: str) -> str:
     alts = get_cosmetic_alternatives(query)
+    base_msg = "🌿 صيدلية بدر البشرية\n\nالمنتج المطلوب غير متوفر حالياً في قائمة الصيدلية."
     if alts:
-        lines = ["🌿 صيدلية بدر البشرية", "", "المنتج المطلوب غير متوفر حالياً.", "⭐ بدائل متوفرة قريبة من نفس النوع:", ""]
+        base_msg += "\n\n⭐ بدائل متوفرة قريبة من نفس النوع:\n"
         for i, alt in enumerate(alts, 1):
-            lines.append(f"{i}) {alt.get('name')} - {alt.get('price', '')}")
-        lines.extend(["", "للحجز اكتب رقم المنتج المطلوب."])
-        return "\n".join(lines)
-        
-    return "🌿 صيدلية بدر البشرية\n\nالمنتج المطلوب غير متوفر حالياً في قائمة الصيدلية. يمكنك إرسال اسم منتج آخر."
+            base_msg += f"{i}) {alt.get('name')} - {alt.get('price', '')}\n"
+    return base_msg
 
+def build_unclear_image_reply() -> str: # (النقطة 15)
+    return "الصورة غير واضحة، الرجاء إرسال صورة أوضح أو كتابة اسم المنتج."
+
+# ==========================================
+# الدالة الرئيسية التي تعالج النصوص
+# ==========================================
 def handle_text_query(phone: str, text: str, user_state: dict) -> str:
-    """الدالة الرئيسية التي سيستدعيها main.py لمعالجة النصوص"""
     q_norm = normalize_text(text)
     
-    # 1. التحقق من الردود المباشرة (نعم، لا) بناءً على حالة الزبون
-    if q_norm in ["نعم", "اي", "حجز"]:
+    if q_norm in ["نعم", "اي", "حجز", "yes"]:
         if "last_product" in user_state:
             item = user_state["last_product"]
-            database.clear_user_state(phone) # تفريغ الذاكرة بعد الحجز
+            database.clear_user_state(phone)
             return f"🌿 صيدلية بدر البشرية\n\nتم تسجيل طلب الحجز للمنتج: {item.get('name')}\nسيتم التواصل معك للتأكيد."
+        return "لا يوجد منتج للحجز حالياً. الرجاء البحث عن منتج أولاً."
             
-    if q_norm in ["لا", "الغاء"]:
+    if q_norm in ["لا", "الغاء", "no"]:
         database.clear_user_state(phone)
         return "🌿 صيدلية بدر البشرية\n\nتم الإلغاء. يمكنك البحث عن منتج آخر."
 
-    # 2. البحث عن المنتج
-    item = exact_safe_product_match(text)
-    if item:
-        # حفظ المنتج في قاعدة البيانات كحالة للزبون
+    status, item = safe_match(text)
+    if status == "BRAND_ONLY": return "الرجاء تحديد اسم المنتج بالكامل أو إرسال صورته (مثال: غسول سيرافي للبشرة الدهنية)."
+    elif status == "CATEGORY_ONLY": return "الرجاء تحديد الشركة المصنعة أو اسم المنتج بالكامل (مثال: غسول سيرافي)."
+    elif status == "MATCHED" and item:
         database.update_user_state(phone, {"last_product": item})
         return build_product_reply(item)
-        
-    # 3. إذا لم يوجد المنتج، نجلب البدائل
-    return build_unavailable_reply(text)
+    else:
+        return build_unavailable_reply(text)
