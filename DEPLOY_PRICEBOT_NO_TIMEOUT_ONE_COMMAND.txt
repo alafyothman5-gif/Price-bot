@@ -1,0 +1,33 @@
+sudo bash -lc '
+set -e
+APP=/opt/pricebot
+cd "$APP"
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+./venv/bin/python -m py_compile app.py matcher.py fast_matcher.py database.py
+cat > /etc/systemd/system/pricebot.service <<EOF
+[Unit]
+Description=PriceBot WhatsApp Webhook
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/pricebot
+EnvironmentFile=-/opt/pricebot/.env
+Environment=PRICEBOT_BACKGROUND_WARMUP=0
+Environment=PRICEBOT_SKIP_STARTUP_WARMUP=1
+ExecStart=/opt/pricebot/venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl restart pricebot
+sleep 5
+systemctl status pricebot --no-pager -l | sed -n "1,35p"
+curl -kfsS https://46.101.148.246.sslip.io/health || true
+journalctl -u pricebot -n 80 --no-pager
+'
