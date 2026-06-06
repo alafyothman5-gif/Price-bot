@@ -1,0 +1,16 @@
+{
+  "flagyl": "metronidazole",
+  "metronidazole": "metronidazole",
+  "panadol": "paracetamol",
+  "adol": "paracetamol",
+  "paracetamol": "paracetamol",
+  "amoclan": "amoxicillin + clavulanic acid",
+  "augmentin": "amoxicillin + clavulanic acid",
+  "amoxicillin clavulanic": "amoxicillin + clavulanic acid",
+  "brufen": "ibuprofen",
+  "ibuprofen": "ibuprofen",
+  "voltaren": "diclofenac",
+  "cataflam": "diclofenac potassium",
+  "zyrtec": "cetirizine",
+  "congestal": "paracetamol + chlorpheniramine + pseudoephedrine"
+}
