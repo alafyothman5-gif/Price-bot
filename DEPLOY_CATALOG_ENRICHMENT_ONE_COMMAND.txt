@@ -1,0 +1,8 @@
+# بعد رفع ZIP إلى السيرفر داخل /root مثلاً، شغّل هذا الأمر من التيرمنل:
+cd /opt/pricebot && sudo cp -a /opt/pricebot "/root/pricebot_BACKUP_BEFORE_CATALOG_ENRICHMENT_$(date +%Y%m%d_%H%M%S)" && sudo unzip -o /root/PriceBot_Catalog_Enrichment_READY.zip -d /opt/pricebot && sudo chown -R root:root /opt/pricebot && python3 -m pip install -r requirements.txt && python3 -m py_compile app.py database.py matcher.py matcher_v2.py matcher_v3.py matcher_v4.py admin.py tools/enrich_products_catalog.py && python3 -m unittest discover -s tests -v && sudo systemctl restart pricebot && sudo systemctl status pricebot --no-pager -l
+
+# تجهيز ملف المنتجات بعد وضع PriceList.xlsx داخل /opt/pricebot:
+cd /opt/pricebot && python3 tools/enrich_products_catalog.py --input PriceList.xlsx --out-ready products_enriched_ready.xlsx --out-review products_needs_review.xlsx --out-report catalog_quality_report.json
+
+# إذا صاحب الصيدلية أكد أن الملف يحتوي المنتجات المتوفرة فقط:
+cd /opt/pricebot && python3 tools/enrich_products_catalog.py --input PriceList.xlsx --default-available true
