@@ -1,8 +1,0 @@
-انسخ الأمر التالي بعد رفع ملفات V17.5 إلى GitHub. لا يلمس .env ولا pricebot.db ولا MedMCQ.
-
-مهم قبل الإنتاج:
-- أضف META_APP_SECRET داخل /opt/pricebot/.env من Meta App Secret.
-- اجعل PRICEBOT_ENV=production أو PRICEBOT_REQUIRE_META_SIGNATURE=true.
-- لا تجعل PRICEBOT_DEBUG_ENDPOINTS=true في الإنتاج.
-
-bash -lc 'LOG="/tmp/pricebot_deploy_v17_5_$(date +%F_%H%M%S).log"; echo "LOG=$LOG"; { rm -rf /tmp/pricebot_v17_5_src; git clone --depth 1 https://github.com/alafyothman5-gif/Price-bot.git /tmp/pricebot_v17_5_src; SRC="/tmp/pricebot_v17_5_src"; if [ ! -f "$SRC/app.py" ]; then FOUND=$(find "$SRC" -maxdepth 2 -name app.py | head -n 1); SRC=$(dirname "$FOUND"); fi; test -f "$SRC/app.py" || { echo "ERROR: app.py not found"; exit 1; }; sudo mkdir -p /root/pricebot_backups; sudo tar -czf /root/pricebot_backups/pricebot_before_v17_5_$(date +%F_%H%M%S).tar.gz -C /opt pricebot --exclude="pricebot/venv" --exclude="pricebot/__pycache__" --exclude="pricebot/.env" --exclude="pricebot/pricebot.db" || echo "Backup warning only"; sudo rsync -a --delete --exclude=".git" --exclude=".env" --exclude="pricebot.db" --exclude="*.db" --exclude="venv" --exclude="__pycache__" --exclude="backups" "$SRC"/ /opt/pricebot/; cd /opt/pricebot; sudo python3 -m venv venv; sudo ./venv/bin/pip install --upgrade pip; sudo ./venv/bin/pip install -r requirements.txt; sudo ./venv/bin/python -m py_compile app.py matcher.py matcher_v4.py database.py admin.py matcher_v3.py matcher_v2.py; sudo ./venv/bin/python acceptance_tests_final_v17_5.py; sudo systemctl restart pricebot; sleep 4; sudo systemctl status pricebot --no-pager -l; curl -k https://46.101.148.246.sslip.io/health || true; } 2>&1 | tee "$LOG"; echo; echo "لو صار خطأ:"; echo "tail -n 160 $LOG";'
