@@ -1,5 +1,0 @@
-print("DEPRECATED: this legacy entrypoint no longer contains independent tests.")
-print("Run: python acceptance_tests_final_v17.py")
-print("Run: python acceptance_tests_final_v17_1.py")
-print("Run: python acceptance_tests_final_v17_2.py")
-print("Run: python acceptance_tests_final_v17_4.py")
